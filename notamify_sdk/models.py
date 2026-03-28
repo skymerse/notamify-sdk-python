@@ -2,13 +2,63 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class NotamifyModel(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+PageNumber = Annotated[int, Field(ge=1)]
+QueryPerPage = Annotated[int, Field(ge=1, le=30)]
+
+
+def _as_mapping(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="python", exclude_none=True)
+    if isinstance(value, dict):
+        return dict(value)
+    return None
+
+
+def _normalize_repeated_payload(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _merge_legacy_lifecycle_payload(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+
+    payload = dict(value)
+    legacy_enabled = payload.pop("lifecycle_enabled", None)
+    if legacy_enabled is None:
+        return payload
+
+    lifecycle_payload = _as_mapping(payload.get("lifecycle")) or {}
+    lifecycle_payload.setdefault("enabled", legacy_enabled)
+    payload["lifecycle"] = lifecycle_payload
+    return payload
+
+
+def _normalize_lifecycle_types(value: Any) -> Any:
+    if value is None:
+        return None
+
+    items = value if isinstance(value, list) else [value]
+    normalized: list[str] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, Enum):
+            item = item.value
+        normalized.append(str(item).strip().upper())
+    return normalized
 
 
 # Watcher models
@@ -30,6 +80,7 @@ class ListenerAffectedElementFilter(NotamifyModel):
 class ListenerFilters(NotamifyModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
+    notam_id: list[str] | None = None
     notam_icao: list[str] | None = None
     notam_type: list[str] | None = None
     airport_type: list[str] | None = None
@@ -39,10 +90,40 @@ class ListenerFilters(NotamifyModel):
     time_windows: list[ListenerTimeWindowFilter] | None = None
     affected_element: list[ListenerAffectedElementFilter] | None = None
 
+    @field_validator("affected_element", mode="before")
+    @classmethod
+    def normalize_affected_element(cls, value: Any) -> Any:
+        return _normalize_repeated_payload(value)
+
 
 class ListenerMode(str, Enum):
     prod = "prod"
     sandbox = "sandbox"
+
+
+class ListenerLifecycleType(str, Enum):
+    cancelled = "CANCELLED"
+    replaced = "REPLACED"
+
+
+class ListenerLifecycle(NotamifyModel):
+    enabled: bool = False
+    types: list[ListenerLifecycleType] = Field(default_factory=list)
+
+    @field_validator("types", mode="before")
+    @classmethod
+    def normalize_types(cls, value: Any) -> Any:
+        return _normalize_lifecycle_types(value)
+
+
+class ListenerLifecycleRequest(NotamifyModel):
+    enabled: bool | None = None
+    types: list[ListenerLifecycleType] | None = None
+
+    @field_validator("types", mode="before")
+    @classmethod
+    def normalize_types(cls, value: Any) -> Any:
+        return _normalize_lifecycle_types(value)
 
 
 class ListenerRequest(NotamifyModel):
@@ -50,9 +131,24 @@ class ListenerRequest(NotamifyModel):
     webhook_url: str | None = None
     email: str | None = None
     filters: ListenerFilters = Field(default_factory=ListenerFilters)
+    lifecycle: ListenerLifecycleRequest | None = None
     active: bool | None = None
     mode: ListenerMode | None = None
-    lifecycle_enabled: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def merge_legacy_lifecycle_enabled(cls, value: Any) -> Any:
+        return _merge_legacy_lifecycle_payload(value)
+
+    @property
+    def lifecycle_enabled(self) -> bool | None:
+        if self.lifecycle is None:
+            return None
+        return self.lifecycle.enabled
+
+
+class ListenerTeam(NotamifyModel):
+    owner: str = ""
 
 
 class Listener(NotamifyModel):
@@ -61,13 +157,23 @@ class Listener(NotamifyModel):
     webhook_url: str = ""
     email: str = ""
     filters: ListenerFilters = Field(default_factory=ListenerFilters)
+    lifecycle: ListenerLifecycle = Field(default_factory=ListenerLifecycle)
     metadata: ListenerMetadata = Field(default_factory=ListenerMetadata)
     active: bool = True
     mode: ListenerMode = ListenerMode.prod
-    lifecycle_enabled: bool = False
+    team: ListenerTeam | None = None
     webhook_secret: str | None = None
     created_at: str = ""
     updated_at: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def merge_legacy_lifecycle_enabled(cls, value: Any) -> Any:
+        return _merge_legacy_lifecycle_payload(value)
+
+    @property
+    def lifecycle_enabled(self) -> bool:
+        return self.lifecycle.enabled
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Listener":
@@ -241,7 +347,6 @@ class CriticalOperationalRestrictionGroup(NotamifyModel):
 class BriefingResponse(NotamifyModel):
     text: str
     critical_operational_restrictions: list[CriticalOperationalRestrictionGroup] = Field(default_factory=list)
-    highlights: list[str] | None = None
 
 
 class GenerateFlightBriefingResponse(NotamifyModel):
@@ -251,6 +356,10 @@ class GenerateFlightBriefingResponse(NotamifyModel):
 
 class BriefingJobCreated(NotamifyModel):
     uuid: str = ""
+    status: BriefingStatus | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    message: str | None = None
     status_url: str = ""
 
 
@@ -332,21 +441,26 @@ class ActiveNotamsQuery(NotamifyModel):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     always_include_est: bool | None = None
-    page: int | None = None
-    per_page: int | None = None
+    page: PageNumber | None = None
+    per_page: QueryPerPage | None = None
     location: list[str] | None = None
     qcode: list[str] | None = None
     category: list[str] | None = None
     subcategory: list[str] | None = None
-    affected_element: list[str] | None = None
+    affected_element: list[str | ListenerAffectedElementFilter] | None = None
+
+    @field_validator("affected_element", mode="before")
+    @classmethod
+    def normalize_affected_element(cls, value: Any) -> Any:
+        return _normalize_repeated_payload(value)
 
 
 class NearbyNotamsQuery(NotamifyModel):
     lat: float
     lon: float
     radius_nm: float | None = None
-    page: int | None = None
-    per_page: int | None = None
+    page: PageNumber | None = None
+    per_page: QueryPerPage | None = None
     excluded_classifications: list[str] | None = None
     qcode: list[str] | None = None
     notam_ids: list[str] | None = None
@@ -355,19 +469,29 @@ class NearbyNotamsQuery(NotamifyModel):
     always_include_est: bool | None = None
     category: list[str] | None = None
     subcategory: list[str] | None = None
-    affected_element: list[str] | None = None
+    affected_element: list[str | ListenerAffectedElementFilter] | None = None
+
+    @field_validator("affected_element", mode="before")
+    @classmethod
+    def normalize_affected_element(cls, value: Any) -> Any:
+        return _normalize_repeated_payload(value)
 
 
 class HistoricalNotamsQuery(NotamifyModel):
     valid_at: date
     notam_ids: list[str] | None = None
     always_include_est: bool | None = None
-    page: int | None = None
-    per_page: int | None = None
+    page: PageNumber | None = None
+    per_page: QueryPerPage | None = None
     location: list[str] | None = None
     category: list[str] | None = None
     subcategory: list[str] | None = None
-    affected_element: list[str] | None = None
+    affected_element: list[str | ListenerAffectedElementFilter] | None = None
+
+    @field_validator("affected_element", mode="before")
+    @classmethod
+    def normalize_affected_element(cls, value: Any) -> Any:
+        return _normalize_repeated_payload(value)
 
 
 class ErrorResponse(NotamifyModel):

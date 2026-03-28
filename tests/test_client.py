@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from pydantic import ValidationError
+
 from notamify_sdk.client import APIError, NotamifyClient, SDK_VERSION
 
 
@@ -39,6 +41,7 @@ class _Handler(BaseHTTPRequestHandler):
     last_create_body = {}
     last_update_body = {}
     last_sandbox_body = {}
+    notam_page_queries = []
 
     def do_GET(self):
         url = urlsplit(self.path)
@@ -55,10 +58,11 @@ class _Handler(BaseHTTPRequestHandler):
                             "name": "listener-1",
                             "webhook_url": "https://x",
                             "filters": {"notam_icao": ["KJFK"]},
+                            "lifecycle": {"enabled": False, "types": []},
                             "metadata": {"notams_shipped": 7},
+                            "team": {"owner": "teammate-1"},
                             "active": True,
                             "mode": "prod",
-                            "lifecycle_enabled": False,
                             "created_at": "2026-02-25T09:00:00Z",
                             "updated_at": "2026-02-25T10:00:00Z",
                         }
@@ -74,6 +78,32 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/notams":
+            if query.get("location") == ["PAGED"]:
+                _Handler.notam_page_queries.append(query)
+                page = int(query.get("page", ["1"])[0])
+                per_page = int(query.get("per_page", ["2"])[0])
+                all_notams = [
+                    _sample_notam("n-page-1"),
+                    _sample_notam("n-page-2"),
+                    _sample_notam("n-page-3"),
+                    _sample_notam("n-page-4"),
+                    _sample_notam("n-page-5"),
+                ]
+                start = (page - 1) * per_page
+                end = start + per_page
+                self._send(
+                    200,
+                    {
+                        "notams": all_notams[start:end],
+                        "total_count": len(all_notams),
+                        "page": page,
+                        "per_page": per_page,
+                    },
+                )
+                return
+            if query.get("affected_element") and query.get("affected_element") != ["effect:CLOSED,type:RUNWAY"]:
+                self._send(400, {"error": "affected_element query serialization is invalid"})
+                return
             if "starts_at" in query:
                 starts_at = query.get("starts_at", [""])[0]
                 if starts_at not in {"2026-02-25T10:00:00Z", "2026-02-25T10:00:00+00:00"}:
@@ -160,10 +190,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "name": body.get("name", ""),
                     "webhook_url": "https://x",
                     "filters": body.get("filters", {}),
+                    "lifecycle": body.get("lifecycle", {"enabled": False, "types": []}),
                     "metadata": {"notams_shipped": 0},
                     "active": True,
                     "mode": body.get("mode", "prod"),
-                    "lifecycle_enabled": body.get("lifecycle_enabled", False),
                     "webhook_secret": "nmf_wh_new_listener",
                     "created_at": "2026-02-25T10:00:00Z",
                     "updated_at": "2026-02-25T10:00:00Z",
@@ -191,7 +221,17 @@ class _Handler(BaseHTTPRequestHandler):
             if not body.get("locations"):
                 self._send(400, {"error": "locations are required"})
                 return
-            self._send(201, {"uuid": "job-1", "status_url": "/api/v2/notams/briefing/job-1"})
+            self._send(
+                201,
+                {
+                    "uuid": "job-1",
+                    "status": "pending",
+                    "created_at": "2026-02-25T10:00:00Z",
+                    "updated_at": "2026-02-25T10:01:00Z",
+                    "message": "Briefing generation started",
+                    "status_url": "/api/v2/notams/briefing/job-1",
+                },
+            )
             return
         if path == "/notams/prioritisation":
             body = self._body_json()
@@ -229,10 +269,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "name": body.get("name", ""),
                     "webhook_url": "https://x2",
                     "filters": body.get("filters", {}),
+                    "lifecycle": body.get("lifecycle", {"enabled": False, "types": []}),
                     "metadata": {"notams_shipped": 10},
                     "active": True,
                     "mode": body.get("mode", "prod"),
-                    "lifecycle_enabled": body.get("lifecycle_enabled", False),
                     "created_at": "2026-02-25T09:00:00Z",
                     "updated_at": "2026-02-25T10:30:00Z",
                 },
@@ -285,28 +325,43 @@ class ClientTests(unittest.TestCase):
         _Handler.last_create_body = {}
         _Handler.last_update_body = {}
         _Handler.last_sandbox_body = {}
+        _Handler.notam_page_queries = []
 
     def test_watcher_methods(self):
         client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
         listeners = client.list_listeners()
         self.assertEqual(len(listeners), 1)
         self.assertEqual(listeners[0].metadata.notams_shipped, 7)
+        self.assertFalse(listeners[0].lifecycle.enabled)
         self.assertFalse(listeners[0].lifecycle_enabled)
+        self.assertEqual(listeners[0].team.owner, "teammate-1")
 
-        created = client.create_listener("https://x", mode="sandbox", lifecycle_enabled=True)
+        created = client.create_listener(
+            "https://x",
+            mode="sandbox",
+            lifecycle={"enabled": True, "types": ["cancelled"]},
+        )
         self.assertEqual(created.id, "new")
         self.assertEqual(created.mode.value, "sandbox")
+        self.assertTrue(created.lifecycle.enabled)
+        self.assertEqual(created.lifecycle.types[0].value, "CANCELLED")
         self.assertTrue(created.lifecycle_enabled)
         self.assertEqual(created.webhook_secret, "nmf_wh_new_listener")
         self.assertEqual(_Handler.last_create_body.get("mode"), "sandbox")
-        self.assertTrue(_Handler.last_create_body.get("lifecycle_enabled"))
+        self.assertEqual(
+            _Handler.last_create_body.get("lifecycle"),
+            {"enabled": True, "types": ["CANCELLED"]},
+        )
+        self.assertNotIn("lifecycle_enabled", _Handler.last_create_body)
 
         updated = client.update_listener("l1", "https://x2", mode="prod", lifecycle_enabled=False)
         self.assertEqual(updated.id, "l1")
         self.assertEqual(updated.mode.value, "prod")
+        self.assertFalse(updated.lifecycle.enabled)
         self.assertFalse(updated.lifecycle_enabled)
         self.assertEqual(_Handler.last_update_body.get("mode"), "prod")
-        self.assertFalse(_Handler.last_update_body.get("lifecycle_enabled"))
+        self.assertEqual(_Handler.last_update_body.get("lifecycle"), {"enabled": False})
+        self.assertNotIn("lifecycle_enabled", _Handler.last_update_body)
 
         client.delete_listener("l1")
         self.assertTrue(client.get_webhook_secret_masked().startswith("nmf_wh_"))
@@ -333,7 +388,13 @@ class ClientTests(unittest.TestCase):
     def test_notam_methods(self):
         client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
 
-        active = client.get_active_notams({"location": ["KJFK", "KLAX"], "always_include_est": True})
+        active = client.get_active_notams(
+            {
+                "location": ["KJFK", "KLAX"],
+                "always_include_est": True,
+                "affected_element": [{"effect": "closed", "type": "runway"}],
+            }
+        )
         self.assertEqual(active.notams[0].id, "n-active")
 
         raw = client.get_raw_notams({"location": ["KJFK"]})
@@ -359,6 +420,8 @@ class ClientTests(unittest.TestCase):
             }
         )
         self.assertEqual(briefing.uuid, "job-1")
+        self.assertEqual(briefing.status.value, "pending")
+        self.assertEqual(briefing.message, "Briefing generation started")
 
         status = client.get_async_briefing_status("job-1")
         self.assertEqual(status.status.value, "completed")
@@ -397,6 +460,71 @@ class ClientTests(unittest.TestCase):
         starts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=timezone.utc)
         result = client.get_active_notams({"starts_at": starts})
         self.assertEqual(result.notams[0].id, "n-datetime")
+
+    def test_notams_resource_iterates_all_items(self):
+        client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
+        pager = client.notams.active({"location": ["PAGED"]}, per_page=2)
+
+        ids = [notam.id for notam in pager]
+
+        self.assertEqual(
+            ids,
+            ["n-page-1", "n-page-2", "n-page-3", "n-page-4", "n-page-5"],
+        )
+        self.assertIs(client.notams, client.notams)
+        self.assertEqual(
+            [query["page"][0] for query in _Handler.notam_page_queries],
+            ["1", "2", "3"],
+        )
+        self.assertTrue(all(query["per_page"] == ["2"] for query in _Handler.notam_page_queries))
+
+    def test_notams_resource_pages_property(self):
+        client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
+        pager = client.notams.active({"location": ["PAGED"]}, per_page=2, max_pages=2)
+
+        pages = list(pager.pages)
+
+        self.assertEqual([page.page for page in pages], [1, 2])
+        self.assertEqual([len(page.notams) for page in pages], [2, 2])
+        self.assertEqual(
+            [query["page"][0] for query in _Handler.notam_page_queries],
+            ["1", "2"],
+        )
+
+    def test_notams_resource_preserves_query_and_supports_page_overrides(self):
+        client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
+        query = {"location": ["PAGED"], "page": 2, "per_page": 4}
+
+        ids = [
+            notam.id
+            for notam in client.notams.active(query, per_page=1, max_pages=2)
+        ]
+
+        self.assertEqual(ids, ["n-page-2", "n-page-3"])
+        self.assertEqual(query, {"location": ["PAGED"], "page": 2, "per_page": 4})
+        self.assertEqual(
+            [query["page"][0] for query in _Handler.notam_page_queries],
+            ["2", "3"],
+        )
+        self.assertTrue(all(query["per_page"] == ["1"] for query in _Handler.notam_page_queries))
+
+    def test_notams_resource_rejects_invalid_limits(self):
+        client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
+
+        with self.assertRaises(ValueError):
+            client.notams.active({"location": ["PAGED"]}, max_pages=0)
+
+        with self.assertRaises(ValidationError):
+            client.notams.active({"location": ["PAGED"]}, per_page=0)
+
+        with self.assertRaises(ValidationError):
+            client.notams.active({"location": ["PAGED"]}, per_page=31)
+
+    def test_single_page_notam_calls_reject_per_page_over_30(self):
+        client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
+
+        with self.assertRaises(ValidationError):
+            client.get_active_notams({"location": ["KJFK"], "per_page": 31})
 
 
 if __name__ == "__main__":

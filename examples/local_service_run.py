@@ -89,7 +89,7 @@ def upsert_sandbox_listener(
             filters={},
             active=True,
             mode=ListenerMode.sandbox,
-            lifecycle_enabled=False,
+            lifecycle={"enabled": False},
         )
         print(f"created sandbox listener id={created.id}")
         return created
@@ -102,7 +102,7 @@ def upsert_sandbox_listener(
         name=current.name or preferred_listener_name,
         active=True,
         mode=ListenerMode.sandbox,
-        lifecycle_enabled=current.lifecycle_enabled,
+        lifecycle=current.lifecycle,
     )
     print(f"updated sandbox listener id={updated.id}")
     return updated

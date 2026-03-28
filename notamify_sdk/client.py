@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -19,9 +20,11 @@ from .models import (
     HistoricalNotamsQuery,
     Listener,
     ListenerFilters,
+    ListenerLifecycleRequest,
     ListenerMode,
     ListenerRequest,
     NearbyNotamsQuery,
+    NotamDTO,
     NotamListResult,
     NotamPrioritisationRequest,
     NotamPrioritisationResult,
@@ -55,6 +58,88 @@ class APIError(Exception):
         return f"APIError(status={self.status}, message={self.message})"
 
 
+class _NotamPageIterator:
+    def __init__(self, iterator_factory: Callable[[], Iterator[NotamListResult]]) -> None:
+        self._iterator_factory = iterator_factory
+
+    def __iter__(self) -> Iterator[NotamListResult]:
+        return self._iterator_factory()
+
+
+class NotamPager:
+    def __init__(self, iterator_factory: Callable[[], Iterator[NotamListResult]]) -> None:
+        self.pages = _NotamPageIterator(iterator_factory)
+
+    def __iter__(self) -> Iterator[NotamDTO]:
+        for page in self.pages:
+            yield from page.notams
+
+
+class NotamsResource:
+    def __init__(self, client: NotamifyClient) -> None:
+        self._client = client
+
+    def active(
+        self,
+        query: ActiveNotamsQuery | Mapping[str, Any] | None = None,
+        *,
+        max_pages: int | None = None,
+        per_page: int | None = None,
+    ) -> NotamPager:
+        return self._client._list_notams(
+            fetch_page=self._client.get_active_notams,
+            query=query,
+            schema=ActiveNotamsQuery,
+            max_pages=max_pages,
+            per_page=per_page,
+        )
+
+    def raw(
+        self,
+        query: ActiveNotamsQuery | Mapping[str, Any] | None = None,
+        *,
+        max_pages: int | None = None,
+        per_page: int | None = None,
+    ) -> NotamPager:
+        return self._client._list_notams(
+            fetch_page=self._client.get_raw_notams,
+            query=query,
+            schema=ActiveNotamsQuery,
+            max_pages=max_pages,
+            per_page=per_page,
+        )
+
+    def nearby(
+        self,
+        query: NearbyNotamsQuery | Mapping[str, Any],
+        *,
+        max_pages: int | None = None,
+        per_page: int | None = None,
+    ) -> NotamPager:
+        return self._client._list_notams(
+            fetch_page=self._client.get_nearby_notams,
+            query=query,
+            schema=NearbyNotamsQuery,
+            max_pages=max_pages,
+            per_page=per_page,
+        )
+
+    def historical(
+        self,
+        query: HistoricalNotamsQuery | Mapping[str, Any],
+        *,
+        max_pages: int | None = None,
+        per_page: int | None = None,
+    ) -> NotamPager:
+        return self._client._list_notams(
+            fetch_page=self._client.get_historical_notams,
+            query=query,
+            schema=HistoricalNotamsQuery,
+            max_pages=max_pages,
+            per_page=per_page,
+        )
+
+
 class NotamifyClient:
     def __init__(
         self,
@@ -69,6 +154,7 @@ class NotamifyClient:
         self.watcher_base_url = watcher_base_url.rstrip("/")
         self.timeout = timeout
         self.user_agent = user_agent
+        self.notams = NotamsResource(self)
 
     # Watcher API
     def list_listeners(self) -> list[Listener]:
@@ -83,18 +169,22 @@ class NotamifyClient:
         name: str = "",
         active: bool | None = None,
         mode: ListenerMode | str | None = None,
+        lifecycle: ListenerLifecycleRequest | Mapping[str, Any] | None = None,
         lifecycle_enabled: bool | None = None,
     ) -> Listener:
-        request_body: dict[str, Any] = {
-            "webhook_url": self._normalize_listener_text(webhook_url),
-            "email": self._normalize_listener_text(email),
-            "filters": filters or {},
-            "name": self._normalize_listener_text(name),
-            "active": active,
-            "mode": self._to_listener_mode(mode) if mode is not None else None,
-            "lifecycle_enabled": lifecycle_enabled,
-        }
-        body = self._prepare_body(request_body, ListenerRequest)
+        body = self._prepare_body(
+            self._build_listener_request_body(
+                webhook_url=webhook_url,
+                email=email,
+                filters=filters,
+                name=name,
+                active=active,
+                mode=mode,
+                lifecycle=lifecycle,
+                lifecycle_enabled=lifecycle_enabled,
+            ),
+            ListenerRequest,
+        )
         payload = self._request("POST", self.watcher_base_url, "/listeners", body=body)
         return Listener.model_validate(payload)
 
@@ -107,18 +197,22 @@ class NotamifyClient:
         name: str = "",
         active: bool | None = None,
         mode: ListenerMode | str | None = None,
+        lifecycle: ListenerLifecycleRequest | Mapping[str, Any] | None = None,
         lifecycle_enabled: bool | None = None,
     ) -> Listener:
-        request_body: dict[str, Any] = {
-            "webhook_url": self._normalize_listener_text(webhook_url),
-            "email": self._normalize_listener_text(email),
-            "filters": filters or {},
-            "name": self._normalize_listener_text(name),
-            "active": active,
-            "mode": self._to_listener_mode(mode) if mode is not None else None,
-            "lifecycle_enabled": lifecycle_enabled,
-        }
-        body = self._prepare_body(request_body, ListenerRequest)
+        body = self._prepare_body(
+            self._build_listener_request_body(
+                webhook_url=webhook_url,
+                email=email,
+                filters=filters,
+                name=name,
+                active=active,
+                mode=mode,
+                lifecycle=lifecycle,
+                lifecycle_enabled=lifecycle_enabled,
+            ),
+            ListenerRequest,
+        )
         payload = self._request("PUT", self.watcher_base_url, f"/listeners/{listener_id}", body=body)
         return Listener.model_validate(payload)
 
@@ -259,6 +353,100 @@ class NotamifyClient:
         model = payload if isinstance(payload, schema) else schema.model_validate(payload)
         return model.model_dump(mode="json", exclude_none=True)
 
+    def _prepare_paged_query(
+        self,
+        payload: Mapping[str, Any] | BaseModel | None,
+        schema: type[ModelT],
+        per_page: int | None,
+    ) -> dict[str, Any]:
+        query_payload = self._prepare_query(payload, schema)
+        if per_page is None:
+            return query_payload
+        query_payload["per_page"] = per_page
+        return self._prepare_query(query_payload, schema)
+
+    def _list_notams(
+        self,
+        fetch_page: Callable[[Mapping[str, Any] | BaseModel | None], NotamListResult],
+        query: Mapping[str, Any] | BaseModel | None,
+        schema: type[ModelT],
+        max_pages: int | None,
+        per_page: int | None,
+    ) -> NotamPager:
+        self._validate_positive_limit("max_pages", max_pages)
+        query_payload = self._prepare_paged_query(query, schema, per_page)
+        return NotamPager(
+            lambda: self._iterate_notam_pages(
+                fetch_page=fetch_page,
+                query=query_payload,
+                max_pages=max_pages,
+            )
+        )
+
+    def _iterate_notam_pages(
+        self,
+        fetch_page: Callable[[Mapping[str, Any] | BaseModel | None], NotamListResult],
+        query: Mapping[str, Any],
+        max_pages: int | None,
+    ) -> Iterator[NotamListResult]:
+        query_payload = dict(query)
+        start_page = int(query_payload.pop("page", 1) or 1)
+        if start_page < 1:
+            raise ValueError("page must be >= 1")
+
+        query_per_page = query_payload.pop("per_page", None)
+        effective_per_page = int(query_per_page) if query_per_page is not None else None
+
+        fetched_pages = 0
+        fetched_items = 0
+        page_number = start_page
+
+        while max_pages is None or fetched_pages < max_pages:
+            page_query = dict(query_payload)
+            page_query["page"] = page_number
+            if effective_per_page is not None:
+                page_query["per_page"] = effective_per_page
+
+            result = fetch_page(page_query)
+            yield result
+
+            fetched_pages += 1
+            items_on_page = len(result.notams)
+            fetched_items += items_on_page
+
+            if items_on_page == 0:
+                break
+            if fetched_items >= result.total_count:
+                break
+
+            resolved_per_page = result.per_page if result.per_page > 0 else effective_per_page
+            if resolved_per_page is not None and items_on_page < resolved_per_page:
+                break
+
+            page_number += 1
+
+    def _build_listener_request_body(
+        self,
+        webhook_url: str | None,
+        email: str,
+        filters: ListenerFilters | Mapping[str, Any] | None,
+        name: str,
+        active: bool | None,
+        mode: ListenerMode | str | None,
+        lifecycle: ListenerLifecycleRequest | Mapping[str, Any] | None,
+        lifecycle_enabled: bool | None,
+    ) -> dict[str, Any]:
+        return {
+            "webhook_url": self._normalize_listener_text(webhook_url),
+            "email": self._normalize_listener_text(email),
+            "filters": filters or {},
+            "name": self._normalize_listener_text(name),
+            "active": active,
+            "mode": self._to_listener_mode(mode) if mode is not None else None,
+            "lifecycle": lifecycle,
+            "lifecycle_enabled": lifecycle_enabled,
+        }
+
     def _encode_query(self, payload: Mapping[str, Any]) -> str:
         flat: list[tuple[str, str]] = []
         for key, value in payload.items():
@@ -282,7 +470,21 @@ class NotamifyClient:
             return value.isoformat()
         if isinstance(value, Enum):
             return str(value.value)
+        if isinstance(value, Mapping):
+            return self._stringify_affected_element_filter(value)
         return str(value)
+
+    def _stringify_affected_element_filter(self, value: Mapping[str, Any]) -> str:
+        effect = str(value.get("effect", "")).strip().upper()
+        element_type = str(value.get("type", "")).strip().upper()
+        parts = []
+        if effect:
+            parts.append(f"effect:{effect}")
+        if element_type:
+            parts.append(f"type:{element_type}")
+        if not parts:
+            raise ValueError("affected_element filter requires effect or type")
+        return ",".join(parts)
 
     def _to_listener_mode(self, value: ListenerMode | str) -> str:
         if isinstance(value, ListenerMode):
@@ -296,3 +498,7 @@ class NotamifyClient:
         if value is None:
             return None
         return str(value).strip()
+
+    def _validate_positive_limit(self, name: str, value: int | None) -> None:
+        if value is not None and value < 1:
+            raise ValueError(f"{name} must be >= 1")

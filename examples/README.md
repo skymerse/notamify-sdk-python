@@ -44,31 +44,29 @@ Optional:
 
 Create a token in the [Notamify API Manager](https://notamify.com/api-manager).
 
-## 3) Fetch NOTAMs across all pages
+## 3) Fetch NOTAMs with the SDK pager
 
-This script paginates until all NOTAM pages are fetched for one endpoint.
+This script keeps the NOTAM examples intentionally simple. It makes a few direct SDK calls with the NOTAM pager resource:
 
-- file: `examples/notams_fetch.py`
-- supported endpoints via `NOTAM_ENDPOINT`: `active`, `raw`, `nearby`, `historical`
+- `client.notams.active(...)`
+- `client.notams.raw(...)`
+- `client.notams.nearby(...)`
+- `client.notams.historical(...)`
+
+It also shows how to access the first page metadata via `pager.pages`.
+
+Use `per_page` values up to `30`; larger values are rejected by the SDK query models.
 
 ```bash
 export NOTAMIFY_TOKEN="your_notamify_token"
-export NOTAM_ENDPOINT="active"
-export NOTAM_LOCATION="KJFK,KLAX"
 uv run python ./examples/notams_fetch.py
 ```
 
-Optional variables:
-
-- `NOTAM_PER_PAGE` (default `100`)
-- `NOTAM_MAX_PAGES` (default `200`)
-- `NOTAM_STARTS_AT`, `NOTAM_ENDS_AT` (ISO datetime)
-- `NOTAM_LAT`, `NOTAM_LON`, `NOTAM_RADIUS_NM` (for `nearby`)
-- `NOTAM_VALID_AT` (YYYY-MM-DD, for `historical`)
+Edit the ICAO codes, coordinates, or page sizes in `examples/notams_fetch.py` to match your own use case.
 
 ## Webhook payload DTO
 
-Sandbox test sends and production sends use the same webhook payload DTO. Watcher can send standard `interpretation` messages and optional `lifecycle` messages for later NOTAMC/NOTAMR changes when the listener has `lifecycle_enabled = true`.
+Sandbox test sends and production sends use the same webhook payload DTO. Watcher can send standard `interpretation` messages and optional `lifecycle` messages for later NOTAMC/NOTAMR changes when the listener has `lifecycle.enabled = true`.
 
 ```json
 {

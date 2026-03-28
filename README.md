@@ -9,6 +9,7 @@ Python SDK for Notamify public APIs:
 
 - Typed API client with one auth token
 - Pydantic response/request models
+- Pager-style NOTAM listing via `client.notams.*` with item iteration and `pager.pages`
 - Supported NOTAM endpoints:
   - `GET /notams`
   - `GET /notams/raw`
@@ -19,7 +20,7 @@ Python SDK for Notamify public APIs:
   - `POST /notams/prioritisation`
 - Watcher listener management + webhook logs/secrets
 - Listener `mode` support (`prod` default, `sandbox` for test-only listeners)
-- Listener `lifecycle_enabled` support for NOTAMC/NOTAMR follow-up events
+- Listener lifecycle support via `lifecycle.enabled` and `lifecycle.types`
 - Sandbox test delivery endpoint (`POST /listeners/{id}/sandbox:send`)
 - Webhook signature verification (`X-Notamify-Signature`)
 - Typed webhook event models for `interpretation` and `lifecycle` payloads
@@ -63,12 +64,18 @@ from notamify_sdk import NotamifyClient
 
 client = NotamifyClient(token="YOUR_TOKEN")
 
-active = client.get_active_notams({
+# The API accepts at most 30 items per page.
+active_notams = list(client.notams.active({
     "location": ["KJFK", "KLAX"],
-    "page": 1,
     "per_page": 30,
-})
-print(active.total_count)
+}))
+print(len(active_notams))
+
+first_page = next(iter(client.notams.active({
+    "location": ["KJFK", "KLAX"],
+    "per_page": 30,
+}).pages))
+print(first_page.total_count)
 
 job = client.create_async_briefing({
     "locations": [{
@@ -84,12 +91,56 @@ print(job.uuid)
 listener = client.create_listener(
     "https://example.trycloudflare.com/webhooks/notamify",
     mode="sandbox",
-    lifecycle_enabled=False,
+    lifecycle={"enabled": False},
 )
 print(listener.webhook_secret)
 sandbox_result = client.send_sandbox_message(listener.id, "SANDBOX-NOTAM-1")
 print(sandbox_result.notam_id)
 ```
+
+## Pagination
+
+The SDK exposes two NOTAM access styles:
+
+- `client.get_active_notams(...)`, `client.get_raw_notams(...)`, `client.get_nearby_notams(...)`, and `client.get_historical_notams(...)` return a single `NotamListResult` page.
+- `client.notams.active(...)`, `client.notams.raw(...)`, `client.notams.nearby(...)`, and `client.notams.historical(...)` return a pager that fetches all pages lazily as you iterate.
+
+Use the pager when you want all NOTAMs across pages:
+
+```python
+pager = client.notams.active(
+    {"location": ["KJFK", "KLAX"]},
+    per_page=30,
+)
+
+for notam in pager:
+    print(notam.id)
+```
+
+If you want everything in memory at once, materialize the pager with `list(...)`:
+
+```python
+all_notams = list(
+    client.notams.active(
+        {"location": ["KJFK", "KLAX"]},
+        per_page=30,
+    )
+)
+```
+
+If you need page metadata such as `page`, `per_page`, or `total_count`, iterate over `pager.pages`:
+
+```python
+pager = client.notams.active(
+    {"location": ["KJFK", "KLAX"]},
+    per_page=30,
+)
+
+for page in pager.pages:
+    print(page.page, page.total_count, len(page.notams))
+```
+
+The API allows at most `30` items per page. The SDK validates this with Pydantic and rejects larger `per_page` values.
 
 ## Local Webhook Testing
 
@@ -115,7 +166,7 @@ uv run python ./examples/local_service_run.py
 
 - `examples/service_receiver.py`: minimal production-style webhook receiver
 - `examples/local_service_run.py`: cloudflared tunnel + sandbox delivery flow
-- `examples/notams_fetch.py`: paginated NOTAM fetch example
+- `examples/notams_fetch.py`: straightforward NOTAM query examples
 - `examples/README.md`: setup notes and sample payloads
 
 ## Development

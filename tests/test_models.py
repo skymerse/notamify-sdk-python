@@ -3,7 +3,12 @@ import unittest
 from pydantic import ValidationError
 
 from notamify_sdk.models import (
+    ActiveNotamsQuery,
     BriefingResponse,
+    HistoricalNotamsQuery,
+    Listener,
+    ListenerRequest,
+    NearbyNotamsQuery,
     NotamListResult,
     NotamPriority,
     PrioritizedNotamDTO,
@@ -37,6 +42,16 @@ class ModelTests(unittest.TestCase):
     def test_required_fields_enforced(self):
         with self.assertRaises(ValidationError):
             NotamListResult.model_validate({"notams": []})
+
+    def test_notam_query_per_page_is_limited_to_30(self):
+        with self.assertRaises(ValidationError):
+            ActiveNotamsQuery.model_validate({"location": ["KJFK"], "per_page": 31})
+
+        with self.assertRaises(ValidationError):
+            NearbyNotamsQuery.model_validate({"lat": 40.0, "lon": -73.0, "per_page": 31})
+
+        with self.assertRaises(ValidationError):
+            HistoricalNotamsQuery.model_validate({"valid_at": "2026-02-20", "per_page": 31})
 
     def test_priority_enum(self):
         model = PrioritizedNotamDTO.model_validate(
@@ -73,6 +88,36 @@ class ModelTests(unittest.TestCase):
             }
         )
         self.assertEqual(model.critical_operational_restrictions[0].location_role.value, "origin")
+
+    def test_listener_request_accepts_nested_lifecycle_shape(self):
+        model = ListenerRequest.model_validate(
+            {
+                "webhook_url": "https://example.com/hook",
+                "filters": {},
+                "lifecycle": {
+                    "enabled": True,
+                    "types": ["cancelled", "REPLACED"],
+                },
+            }
+        )
+        self.assertTrue(model.lifecycle.enabled)
+        self.assertEqual([item.value for item in model.lifecycle.types], ["CANCELLED", "REPLACED"])
+
+    def test_listener_model_maps_legacy_lifecycle_enabled_to_nested_shape(self):
+        model = Listener.model_validate(
+            {
+                "id": "l1",
+                "filters": {},
+                "metadata": {"notams_shipped": 0},
+                "active": True,
+                "mode": "prod",
+                "lifecycle_enabled": True,
+                "created_at": "2026-03-01T10:00:00Z",
+                "updated_at": "2026-03-01T10:01:00Z",
+            }
+        )
+        self.assertTrue(model.lifecycle.enabled)
+        self.assertTrue(model.lifecycle_enabled)
 
     def test_watcher_lifecycle_payload_validation(self):
         model = WatcherWebhookEvent.model_validate(

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from notamify_sdk.client import APIError, NotamifyClient, SDK_VERSION
-from notamify_sdk.models import Listener
+from notamify_sdk.models import Listener, ListenerLifecycleRequest, ListenerMode
 
 _DEFAULT_BASE_URL = "https://watcher.notamify.com"
 
@@ -35,9 +35,12 @@ class WatcherClient(NotamifyClient):
         self,
         webhook_url: str,
         email: str = "",
-        filters: dict[str, Any] | None = None,
+        filters: Mapping[str, Any] | None = None,
         name: str = "",
         active: bool | None = None,
+        mode: ListenerMode | str | None = None,
+        lifecycle: ListenerLifecycleRequest | Mapping[str, Any] | None = None,
+        lifecycle_enabled: bool | None = None,
     ) -> Listener:
         return super().create_listener(
             webhook_url=webhook_url,
@@ -45,6 +48,9 @@ class WatcherClient(NotamifyClient):
             filters=filters,
             name=name,
             active=active,
+            mode=mode,
+            lifecycle=lifecycle,
+            lifecycle_enabled=lifecycle_enabled,
         )
 
     def update_listener(
@@ -52,9 +58,12 @@ class WatcherClient(NotamifyClient):
         listener_id: str,
         webhook_url: str,
         email: str = "",
-        filters: dict[str, Any] | None = None,
+        filters: Mapping[str, Any] | None = None,
         name: str = "",
         active: bool | None = None,
+        mode: ListenerMode | str | None = None,
+        lifecycle: ListenerLifecycleRequest | Mapping[str, Any] | None = None,
+        lifecycle_enabled: bool | None = None,
     ) -> Listener:
         return super().update_listener(
             listener_id=listener_id,
@@ -63,4 +72,7 @@ class WatcherClient(NotamifyClient):
             filters=filters,
             name=name,
             active=active,
+            mode=mode,
+            lifecycle=lifecycle,
+            lifecycle_enabled=lifecycle_enabled,
         )
