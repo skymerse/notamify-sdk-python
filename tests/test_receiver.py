@@ -9,15 +9,20 @@ from notamify_sdk.signature import compute_signature
 
 
 class ReceiverTests(unittest.TestCase):
-    def test_receiver_strict_and_dev_mode(self):
-        receiver = WebhookReceiver(ReceiverConfig(port=18081, secret="sec", require_signature=True))
+    def _start_receiver(self, **config_kwargs):
+        receiver = WebhookReceiver(ReceiverConfig(port=0, **config_kwargs))
         receiver.start()
+        port = receiver._server.server_address[1]
+        return receiver, f"http://127.0.0.1:{port}"
+
+    def test_receiver_strict_and_dev_mode(self):
+        receiver, base_url = self._start_receiver(secret="sec", require_signature=True)
         try:
             body = b'{"hello": "world"}'
             ts = int(time.time())
             sig = compute_signature("sec", ts, body)
             req = request.Request(
-                "http://127.0.0.1:18081/",
+                f"{base_url}/",
                 method="POST",
                 data=body,
                 headers={"Content-Type": "application/json", "X-Notamify-Signature": f"t={ts},v1={sig}"},
@@ -27,13 +32,12 @@ class ReceiverTests(unittest.TestCase):
         finally:
             receiver.stop()
 
-        dev_receiver = WebhookReceiver(
-            ReceiverConfig(port=18082, secret="", require_signature=True, allow_unsigned_dev=True)
+        dev_receiver, dev_base_url = self._start_receiver(
+            secret="", require_signature=True, allow_unsigned_dev=True
         )
-        dev_receiver.start()
         try:
             req = request.Request(
-                "http://127.0.0.1:18082/",
+                f"{dev_base_url}/",
                 method="POST",
                 data=b"{}",
                 headers={"Content-Type": "application/json"},
@@ -44,11 +48,10 @@ class ReceiverTests(unittest.TestCase):
             dev_receiver.stop()
 
     def test_receiver_rejects_unsigned_when_strict(self):
-        receiver = WebhookReceiver(ReceiverConfig(port=18083, secret="sec", require_signature=True))
-        receiver.start()
+        receiver, base_url = self._start_receiver(secret="sec", require_signature=True)
         try:
             req = request.Request(
-                "http://127.0.0.1:18083/",
+                f"{base_url}/",
                 method="POST",
                 data=b"{}",
                 headers={"Content-Type": "application/json"},
@@ -60,14 +63,13 @@ class ReceiverTests(unittest.TestCase):
             receiver.stop()
 
     def test_receiver_accepts_query_string_on_path(self):
-        receiver = WebhookReceiver(ReceiverConfig(port=18084, secret="sec", require_signature=True))
-        receiver.start()
+        receiver, base_url = self._start_receiver(secret="sec", require_signature=True)
         try:
             body = b'{"ok": true}'
             ts = int(time.time())
             sig = compute_signature("sec", ts, body)
             req = request.Request(
-                "http://127.0.0.1:18084/?dev=1",
+                f"{base_url}/?dev=1",
                 method="POST",
                 data=body,
                 headers={"Content-Type": "application/json", "X-Notamify-Signature": f"t={ts},v1={sig}"},
@@ -78,23 +80,20 @@ class ReceiverTests(unittest.TestCase):
             receiver.stop()
 
     def test_receiver_strict_requires_secret(self):
-        receiver = WebhookReceiver(
-            ReceiverConfig(port=18085, secret="", require_signature=True, allow_unsigned_dev=False)
-        )
+        receiver = WebhookReceiver(ReceiverConfig(port=0, secret="", require_signature=True, allow_unsigned_dev=False))
         with self.assertRaises(ValueError):
             receiver.start()
 
     def test_receiver_default_secret_from_env(self):
         os.environ["NOTAMIFY_WEBHOOK_SECRET"] = "env-secret"
         try:
-            cfg = ReceiverConfig(port=18086, require_signature=True)
+            cfg = ReceiverConfig(port=0, require_signature=True)
         finally:
             del os.environ["NOTAMIFY_WEBHOOK_SECRET"]
         self.assertEqual(cfg.secret, "env-secret")
 
     def test_receiver_parses_typed_lifecycle_webhook(self):
-        receiver = WebhookReceiver(ReceiverConfig(port=18087, secret="sec", require_signature=True))
-        receiver.start()
+        receiver, base_url = self._start_receiver(secret="sec", require_signature=True)
         try:
             body = json.dumps(
                 {
@@ -120,7 +119,7 @@ class ReceiverTests(unittest.TestCase):
             ts = int(time.time())
             sig = compute_signature("sec", ts, body)
             req = request.Request(
-                "http://127.0.0.1:18087/",
+                f"{base_url}/",
                 method="POST",
                 data=body,
                 headers={"Content-Type": "application/json", "X-Notamify-Signature": f"t={ts},v1={sig}"},

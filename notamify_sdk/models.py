@@ -235,11 +235,95 @@ class NotamPriority(str, Enum):
     low = "LOW"
 
 
+class ValueComponentDTO(NotamifyModel):
+    type: str | None = None
+    value: int | str
+    unit: str | None = None
+
+
+class ValueDTO(NotamifyModel):
+    kind: str | None = None
+    raw_string: str
+    values: list[ValueComponentDTO] = Field(default_factory=list)
+
+
+class MeasurementComponentValueDTO(NotamifyModel):
+    type: str
+    value: int
+    unit: str
+
+
+class IntegerMeasurementValueDTO(NotamifyModel):
+    kind: str | None = None
+    raw_string: str
+    value: int
+    unit: str
+
+
+class FractionalMeasurementValueDTO(NotamifyModel):
+    kind: str | None = None
+    raw_string: str
+    numerator: int
+    denominator: int
+    unit: str
+
+
+class GroupedMeasurementValueDTO(NotamifyModel):
+    kind: str | None = None
+    raw_string: str
+    values: list[MeasurementComponentValueDTO] = Field(default_factory=list)
+
+
+class ProcedureCapabilityDTO(NotamifyModel):
+    scheme: str
+    category: str | None = None
+    level: str | None = None
+    classification: str | None = None
+    source_label: str | None = None
+
+
+class AffectedElementReferenceDTO(NotamifyModel):
+    relation: str
+    type: str | None = None
+    identifier: str | None = None
+
+
+class AffectedElementChangeDTO(NotamifyModel):
+    subject: str
+    from_: list[ProcedureCapabilityDTO | ValueDTO] = Field(default_factory=list, alias="from")
+    to: list[ProcedureCapabilityDTO | ValueDTO] = Field(default_factory=list)
+    details: str | None = None
+
+
+class AffectedElementClauseDTO(NotamifyModel):
+    dimension: str
+    operator: str
+    value: (
+        IntegerMeasurementValueDTO
+        | FractionalMeasurementValueDTO
+        | GroupedMeasurementValueDTO
+        | ProcedureCapabilityDTO
+        | list[str]
+    )
+    unit: str | None = None
+    details: str | None = None
+
+
+class AffectedElementSemanticsDTO(NotamifyModel):
+    scope: list[AffectedElementClauseDTO] = Field(default_factory=list)
+    conditions: list[AffectedElementClauseDTO] = Field(default_factory=list)
+    exceptions: list[AffectedElementClauseDTO] = Field(default_factory=list)
+    changes: list[AffectedElementChangeDTO] = Field(default_factory=list)
+    references: list[AffectedElementReferenceDTO] = Field(default_factory=list)
+
+
 class AffectedElementDTO(NotamifyModel):
     type: str
     identifier: str
     effect: str
     details: str | None = None
+    subtype: str | None = None
+    semantics: AffectedElementSemanticsDTO | None = None
 
 
 class NotamScheduleInterpretationDTO(NotamifyModel):
