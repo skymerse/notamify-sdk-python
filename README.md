@@ -57,36 +57,24 @@ Environment variables (highest priority):
 
 Default config file: `~/.config/notamify/config.json`
 
-## Usage
+## Qucik start
 
+### Get active NOTAMs
 ```python
-from notamify_sdk import NotamifyClient
+from datetime import datetime, timedelta
+from notamify_sdk import NotamifyClient, ActiveNotamsQuery
 
-client = NotamifyClient(token="YOUR_TOKEN")
+client = NotamifyClient(token="YOUR_API_KEY")
 
-# The API accepts at most 30 items per page.
-active_notams = list(client.notams.active({
-    "location": ["KJFK", "KLAX"],
-    "per_page": 30,
-}))
-print(len(active_notams))
+query = ActiveNotamsQuery(
+    location=["KJFK", "KLAX"],
+    starts_at=datetime.now(),
+    ends_at=datetime.now() + timedelta(days=1)
+)
+```
 
-first_page = next(iter(client.notams.active({
-    "location": ["KJFK", "KLAX"],
-    "per_page": 30,
-}).pages))
-print(first_page.total_count)
-
-job = client.create_async_briefing({
-    "locations": [{
-        "location": "KJFK",
-        "type": "origin",
-        "starts_at": "2026-02-25T10:00:00Z",
-        "ends_at": "2026-02-25T12:00:00Z",
-    }],
-})
-print(job.uuid)
-
+### Watcher flow
+```
 # Watcher sandbox flow
 listener = client.create_listener(
     "https://example.trycloudflare.com/webhooks/notamify",
@@ -139,8 +127,6 @@ pager = client.notams.active(
 for page in pager.pages:
     print(page.page, page.total_count, len(page.notams))
 ```
-
-The API allows at most `30` items per page. The SDK validates this with Pydantic and rejects larger `per_page` values.
 
 ## Local Webhook Testing
 
