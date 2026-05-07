@@ -129,7 +129,7 @@ class ListenerLifecycleRequest(NotamifyModel):
 class ListenerRequest(NotamifyModel):
     name: str | None = None
     webhook_url: str | None = None
-    email: str | None = None
+    emails: list[str] | None = None
     filters: ListenerFilters = Field(default_factory=ListenerFilters)
     lifecycle: ListenerLifecycleRequest | None = None
     active: bool | None = None
@@ -155,7 +155,7 @@ class Listener(NotamifyModel):
     id: str = ""
     name: str = ""
     webhook_url: str = ""
-    email: str = ""
+    emails: list[str] = Field(default_factory=list)
     filters: ListenerFilters = Field(default_factory=ListenerFilters)
     lifecycle: ListenerLifecycle = Field(default_factory=ListenerLifecycle)
     metadata: ListenerMetadata = Field(default_factory=ListenerMetadata)

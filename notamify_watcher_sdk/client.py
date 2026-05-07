@@ -34,7 +34,7 @@ class WatcherClient(NotamifyClient):
     def create_listener(
         self,
         webhook_url: str,
-        email: str = "",
+        emails: list[str] | None = None,
         filters: Mapping[str, Any] | None = None,
         name: str = "",
         active: bool | None = None,
@@ -44,7 +44,7 @@ class WatcherClient(NotamifyClient):
     ) -> Listener:
         return super().create_listener(
             webhook_url=webhook_url,
-            email=email,
+            emails=emails,
             filters=filters,
             name=name,
             active=active,
@@ -57,7 +57,7 @@ class WatcherClient(NotamifyClient):
         self,
         listener_id: str,
         webhook_url: str,
-        email: str = "",
+        emails: list[str] | None = None,
         filters: Mapping[str, Any] | None = None,
         name: str = "",
         active: bool | None = None,
@@ -68,7 +68,7 @@ class WatcherClient(NotamifyClient):
         return super().update_listener(
             listener_id=listener_id,
             webhook_url=webhook_url,
-            email=email,
+            emails=emails,
             filters=filters,
             name=name,
             active=active,
