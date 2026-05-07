@@ -97,7 +97,7 @@ def upsert_sandbox_listener(
     updated = client.update_listener(
         current.id,
         webhook_url=public_webhook_url,
-        email=current.email,
+        emails=current.emails,
         filters=current.filters,
         name=current.name or preferred_listener_name,
         active=True,

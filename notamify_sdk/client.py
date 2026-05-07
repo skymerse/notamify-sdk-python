@@ -164,7 +164,7 @@ class NotamifyClient:
     def create_listener(
         self,
         webhook_url: str | None = None,
-        email: str = "",
+        emails: list[str] | None = None,
         filters: ListenerFilters | Mapping[str, Any] | None = None,
         name: str = "",
         active: bool | None = None,
@@ -175,7 +175,7 @@ class NotamifyClient:
         body = self._prepare_body(
             self._build_listener_request_body(
                 webhook_url=webhook_url,
-                email=email,
+                emails=emails,
                 filters=filters,
                 name=name,
                 active=active,
@@ -192,7 +192,7 @@ class NotamifyClient:
         self,
         listener_id: str,
         webhook_url: str | None = None,
-        email: str = "",
+        emails: list[str] | None = None,
         filters: ListenerFilters | Mapping[str, Any] | None = None,
         name: str = "",
         active: bool | None = None,
@@ -203,7 +203,7 @@ class NotamifyClient:
         body = self._prepare_body(
             self._build_listener_request_body(
                 webhook_url=webhook_url,
-                email=email,
+                emails=emails,
                 filters=filters,
                 name=name,
                 active=active,
@@ -428,7 +428,7 @@ class NotamifyClient:
     def _build_listener_request_body(
         self,
         webhook_url: str | None,
-        email: str,
+        emails: list[str] | None,
         filters: ListenerFilters | Mapping[str, Any] | None,
         name: str,
         active: bool | None,
@@ -438,7 +438,7 @@ class NotamifyClient:
     ) -> dict[str, Any]:
         return {
             "webhook_url": self._normalize_listener_text(webhook_url),
-            "email": self._normalize_listener_text(email),
+            "emails": emails,
             "filters": filters or {},
             "name": self._normalize_listener_text(name),
             "active": active,

@@ -57,6 +57,7 @@ class _Handler(BaseHTTPRequestHandler):
                             "id": "l1",
                             "name": "listener-1",
                             "webhook_url": "https://x",
+                            "emails": ["ops@example.com"],
                             "filters": {"notam_icao": ["KJFK"]},
                             "lifecycle": {"enabled": False, "types": []},
                             "metadata": {"notams_shipped": 7},
@@ -189,6 +190,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "id": "new",
                     "name": body.get("name", ""),
                     "webhook_url": "https://x",
+                    "emails": body.get("emails", []),
                     "filters": body.get("filters", {}),
                     "lifecycle": body.get("lifecycle", {"enabled": False, "types": []}),
                     "metadata": {"notams_shipped": 0},
@@ -268,6 +270,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "id": "l1",
                     "name": body.get("name", ""),
                     "webhook_url": "https://x2",
+                    "emails": body.get("emails", []),
                     "filters": body.get("filters", {}),
                     "lifecycle": body.get("lifecycle", {"enabled": False, "types": []}),
                     "metadata": {"notams_shipped": 10},
@@ -335,9 +338,11 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(listeners[0].lifecycle.enabled)
         self.assertFalse(listeners[0].lifecycle_enabled)
         self.assertEqual(listeners[0].team.owner, "teammate-1")
+        self.assertEqual(listeners[0].emails, ["ops@example.com"])
 
         created = client.create_listener(
             "https://x",
+            emails=["created@example.com"],
             mode="sandbox",
             lifecycle={"enabled": True, "types": ["cancelled"]},
         )
@@ -347,6 +352,9 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(created.lifecycle.types[0].value, "CANCELLED")
         self.assertTrue(created.lifecycle_enabled)
         self.assertEqual(created.webhook_secret, "nmf_wh_new_listener")
+        self.assertEqual(created.emails, ["created@example.com"])
+        self.assertEqual(_Handler.last_create_body.get("emails"), ["created@example.com"])
+        self.assertNotIn("email", _Handler.last_create_body)
         self.assertEqual(_Handler.last_create_body.get("mode"), "sandbox")
         self.assertEqual(
             _Handler.last_create_body.get("lifecycle"),
@@ -375,10 +383,10 @@ class ClientTests(unittest.TestCase):
 
     def test_update_listener_preserves_explicit_empty_fields(self):
         client = NotamifyClient(token="t", watcher_base_url=self.base_url, api_base_url=self.base_url)
-        client.update_listener("l1", "https://x2", email="", name="")
-        self.assertIn("email", _Handler.last_update_body)
+        client.update_listener("l1", "https://x2", emails=[], name="")
+        self.assertIn("emails", _Handler.last_update_body)
         self.assertIn("name", _Handler.last_update_body)
-        self.assertEqual(_Handler.last_update_body["email"], "")
+        self.assertEqual(_Handler.last_update_body["emails"], [])
         self.assertEqual(_Handler.last_update_body["name"], "")
 
     def test_default_user_agent_tracks_sdk_version(self):

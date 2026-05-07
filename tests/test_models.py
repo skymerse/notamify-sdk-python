@@ -210,6 +210,7 @@ class ModelTests(unittest.TestCase):
         model = ListenerRequest.model_validate(
             {
                 "webhook_url": "https://example.com/hook",
+                "emails": ["ops@example.com"],
                 "filters": {},
                 "lifecycle": {
                     "enabled": True,
@@ -217,13 +218,19 @@ class ModelTests(unittest.TestCase):
                 },
             }
         )
+        self.assertEqual(model.emails, ["ops@example.com"])
         self.assertTrue(model.lifecycle.enabled)
         self.assertEqual([item.value for item in model.lifecycle.types], ["CANCELLED", "REPLACED"])
+
+    def test_listener_request_rejects_scalar_emails(self):
+        with self.assertRaises(ValidationError):
+            ListenerRequest.model_validate({"webhook_url": "https://example.com/hook", "emails": "ops@example.com"})
 
     def test_listener_model_maps_legacy_lifecycle_enabled_to_nested_shape(self):
         model = Listener.model_validate(
             {
                 "id": "l1",
+                "emails": ["ops@example.com"],
                 "filters": {},
                 "metadata": {"notams_shipped": 0},
                 "active": True,
@@ -233,6 +240,7 @@ class ModelTests(unittest.TestCase):
                 "updated_at": "2026-03-01T10:01:00Z",
             }
         )
+        self.assertEqual(model.emails, ["ops@example.com"])
         self.assertTrue(model.lifecycle.enabled)
         self.assertTrue(model.lifecycle_enabled)
 
