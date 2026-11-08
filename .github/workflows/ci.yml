@@ -53,7 +53,14 @@ jobs:
         run: uv sync --python 3.13
 
       - name: Build distributions
-        run: uv build
+        run: make build
 
       - name: Check distributions
         run: uvx --from twine twine check dist/*
+
+      - name: Smoke-test the notamify command
+        run: |
+          python -m venv /tmp/cli
+          /tmp/cli/bin/pip install dist/notamify_sdk-*.whl dist/notamify-*.whl
+          /tmp/cli/bin/notamify --version
+          /tmp/cli/bin/notamify commands --json > /dev/null

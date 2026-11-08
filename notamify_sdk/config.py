@@ -26,6 +26,20 @@ class SDKConfig:
         self.watcher_base_url = value
 
 
+def apply_environment(cfg: SDKConfig) -> SDKConfig:
+    """Override ``cfg`` with NOTAMIFY_* environment variables, which take precedence over the config file."""
+    env_api_base = os.getenv("NOTAMIFY_API_BASE_URL", "").strip()
+    env_watcher_base = os.getenv("NOTAMIFY_WATCHER_BASE_URL", "").strip()
+    env_token = os.getenv("NOTAMIFY_TOKEN", "").strip() or os.getenv("NOTAMIFY_WATCHER_TOKEN", "").strip()
+    if env_api_base:
+        cfg.api_base_url = env_api_base
+    if env_watcher_base:
+        cfg.watcher_base_url = env_watcher_base
+    if env_token:
+        cfg.token = env_token
+    return cfg
+
+
 class ConfigStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or self.default_path()
@@ -52,18 +66,7 @@ class ConfigStore:
             cfg.watcher_base_url = str(raw.get("watcher_base_url", cfg.watcher_base_url)).strip() or cfg.watcher_base_url
             cfg.watcher_base_url = str(raw.get("base_url", cfg.watcher_base_url)).strip() or cfg.watcher_base_url
             cfg.token = str(raw.get("token", cfg.token)).strip()
-
-        env_api_base = os.getenv("NOTAMIFY_API_BASE_URL", "").strip()
-        env_watcher_base = os.getenv("NOTAMIFY_WATCHER_BASE_URL", "").strip()
-        env_token = os.getenv("NOTAMIFY_TOKEN", "").strip() or os.getenv("NOTAMIFY_WATCHER_TOKEN", "").strip()
-
-        if env_api_base:
-            cfg.api_base_url = env_api_base
-        if env_watcher_base:
-            cfg.watcher_base_url = env_watcher_base
-        if env_token:
-            cfg.token = env_token
-        return cfg
+        return apply_environment(cfg)
 
     def save(self, cfg: SDKConfig) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

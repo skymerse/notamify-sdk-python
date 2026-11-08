@@ -8,10 +8,11 @@ from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Mapping, TypeVar
 from urllib import error, request
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from pydantic import BaseModel
 
+from .config import ConfigStore, SDKConfig, apply_environment
 from .models import (
     ActiveNotamsQuery,
     BriefingJobCreated,
@@ -28,7 +29,11 @@ from .models import (
     NotamListResult,
     NotamPrioritisationRequest,
     NotamPrioritisationResult,
+    RecentlyExpiredNotamListResult,
+    RecentlyExpiredNotamsQuery,
     SandboxDeliveryResult,
+    SimpleAirportBriefingQuery,
+    SimpleAirportBriefingResponse,
     WebhookLogsResponse,
 )
 
@@ -40,7 +45,7 @@ def _package_version() -> str:
     try:
         return version("notamify-sdk")
     except PackageNotFoundError:
-        return "0.3.0"
+        return "0.4.0"
 
 
 SDK_VERSION = _package_version()
@@ -139,20 +144,53 @@ class NotamsResource:
             per_page=per_page,
         )
 
+    def recently_expired(
+        self,
+        query: RecentlyExpiredNotamsQuery | Mapping[str, Any] | None = None,
+        *,
+        max_pages: int | None = None,
+        per_page: int | None = None,
+    ) -> NotamPager:
+        return self._client._list_notams(
+            fetch_page=self._client.get_recently_expired_notams,
+            query=query,
+            schema=RecentlyExpiredNotamsQuery,
+            max_pages=max_pages,
+            per_page=per_page,
+        )
+
 
 class NotamifyClient:
+    """Client for the Notamify API v2 and the Watcher API.
+
+    When ``token`` or a base URL is omitted, it is read from ``NOTAMIFY_TOKEN``,
+    ``NOTAMIFY_API_BASE_URL`` and ``NOTAMIFY_WATCHER_BASE_URL``, then from the
+    config file (``NOTAMIFY_CONFIG_FILE`` or ``~/.config/notamify/config.json``).
+    """
+
     def __init__(
         self,
-        token: str,
-        api_base_url: str = _DEFAULT_API_BASE_URL,
-        watcher_base_url: str = _DEFAULT_WATCHER_BASE_URL,
+        token: str | None = None,
+        api_base_url: str | None = None,
+        watcher_base_url: str | None = None,
         timeout: float = 10.0,
         user_agent: str = f"notamify-sdk-python/{SDK_VERSION}",
+        generation_timeout: float = 120.0,
     ) -> None:
+        if token is None or api_base_url is None or watcher_base_url is None:
+            try:
+                cfg = ConfigStore().load()
+            except (OSError, ValueError, AttributeError):
+                # An unreadable config file must not break callers that pass what they need.
+                cfg = apply_environment(SDKConfig())
+            token = cfg.token if token is None else token
+            api_base_url = api_base_url or cfg.api_base_url
+            watcher_base_url = watcher_base_url or cfg.watcher_base_url
         self.token = token.strip()
         self.api_base_url = api_base_url.rstrip("/")
         self.watcher_base_url = watcher_base_url.rstrip("/")
         self.timeout = timeout
+        self.generation_timeout = max(generation_timeout, timeout)
         self.user_agent = user_agent
         self.notams = NotamsResource(self)
 
@@ -188,6 +226,54 @@ class NotamifyClient:
         payload = self._request("POST", self.watcher_base_url, "/listeners", body=body)
         return Listener.model_validate(payload)
 
+    def get_listener(self, listener_id: str) -> Listener:
+        """Return one listener. The Watcher API has no single-listener read, so this lists and filters."""
+        for listener in self.list_listeners():
+            if listener.id == listener_id:
+                return listener
+        raise APIError(404, "listener not found")
+
+    def patch_listener(self, listener_id: str, **changes: Any) -> Listener:
+        """Change only the given fields of a listener and keep everything else.
+
+        Accepts the keyword arguments of ``update_listener``. Fields that are not
+        passed keep their current values. ``filters`` and ``lifecycle`` are merged
+        key by key into the current values; a key set to ``None`` is removed.
+        """
+        unknown = set(changes) - {
+            "webhook_url",
+            "emails",
+            "filters",
+            "name",
+            "active",
+            "mode",
+            "lifecycle",
+            "lifecycle_enabled",
+        }
+        if unknown:
+            raise TypeError(f"unknown listener fields: {sorted(unknown)}")
+        current = self.get_listener(listener_id)
+        merged: dict[str, Any] = {
+            "webhook_url": current.webhook_url or None,
+            "emails": list(current.emails) or None,
+            "filters": current.filters.model_dump(mode="json", exclude_none=True),
+            "name": current.name,
+            "active": current.active,
+            "mode": current.mode,
+            "lifecycle": current.lifecycle.model_dump(mode="json"),
+        }
+        for key in ("filters", "lifecycle"):
+            if key in changes and changes[key] is not None:
+                given = changes.pop(key)
+                if isinstance(given, BaseModel):
+                    given = given.model_dump(mode="json", exclude_none=True)
+                combined = {**merged[key], **dict(given)}
+                merged[key] = {k: v for k, v in combined.items() if v is not None}
+        if changes.pop("lifecycle_enabled", None) is not None:
+            raise TypeError("use lifecycle={'enabled': ...} with patch_listener")
+        merged.update(changes)
+        return self.update_listener(listener_id, **merged)
+
     def update_listener(
         self,
         listener_id: str,
@@ -200,6 +286,7 @@ class NotamifyClient:
         lifecycle: ListenerLifecycleRequest | Mapping[str, Any] | None = None,
         lifecycle_enabled: bool | None = None,
     ) -> Listener:
+        """Replace a listener. Fields that are not passed are cleared; use ``patch_listener`` to change some fields."""
         body = self._prepare_body(
             self._build_listener_request_body(
                 webhook_url=webhook_url,
@@ -213,11 +300,11 @@ class NotamifyClient:
             ),
             ListenerRequest,
         )
-        payload = self._request("PUT", self.watcher_base_url, f"/listeners/{listener_id}", body=body)
+        payload = self._request("PUT", self.watcher_base_url, f"/listeners/{_path_id(listener_id)}", body=body)
         return Listener.model_validate(payload)
 
     def delete_listener(self, listener_id: str) -> None:
-        self._request("DELETE", self.watcher_base_url, f"/listeners/{listener_id}")
+        self._request("DELETE", self.watcher_base_url, f"/listeners/{_path_id(listener_id)}")
 
     def get_webhook_secret_masked(self) -> str:
         payload = self._request("GET", self.watcher_base_url, "/webhook-secret")
@@ -235,7 +322,7 @@ class NotamifyClient:
         body: dict[str, Any] = {}
         if notam_id:
             body["notam_id"] = notam_id
-        payload = self._request("POST", self.watcher_base_url, f"/listeners/{listener_id}/sandbox:send", body=body)
+        payload = self._request("POST", self.watcher_base_url, f"/listeners/{_path_id(listener_id)}/sandbox:send", body=body)
         return SandboxDeliveryResult.model_validate(payload)
 
     # NOTAM API v2
@@ -259,12 +346,45 @@ class NotamifyClient:
         payload = self._request("GET", self.api_base_url, "/notams/archive", query=query_payload)
         return NotamListResult.model_validate(payload)
 
+    def get_recently_expired_notams(
+        self, query: RecentlyExpiredNotamsQuery | Mapping[str, Any] | None = None
+    ) -> RecentlyExpiredNotamListResult:
+        query_payload = self._prepare_query(query, RecentlyExpiredNotamsQuery)
+        payload = self._request("GET", self.api_base_url, "/notams/recently-expired", query=query_payload)
+        return RecentlyExpiredNotamListResult.model_validate(payload)
+
+    def get_notam(self, notam_id: str, *, add_popularity: bool = False) -> NotamDTO:
+        """Return one NOTAM by its Notamify ID, with its full interpretation."""
+        payload = self._request(
+            "GET",
+            self.api_base_url,
+            f"/notams/{_path_id(notam_id)}",
+            query={"add_popularity": add_popularity},
+        )
+        return NotamDTO.model_validate(payload)
+
+    def generate_airport_briefing(
+        self, query: SimpleAirportBriefingQuery | Mapping[str, Any]
+    ) -> SimpleAirportBriefingResponse:
+        """Generate an immediate airport briefing for one location (``GET /notams/briefing/simple``)."""
+        query_payload = self._prepare_query(query, SimpleAirportBriefingQuery)
+        payload = self._request(
+            "GET",
+            self.api_base_url,
+            "/notams/briefing/simple",
+            query=query_payload,
+            timeout=self.generation_timeout,
+        )
+        return SimpleAirportBriefingResponse.model_validate(payload)
+
     def create_async_briefing(
         self,
         payload: GenerateFlightBriefingRequest | Mapping[str, Any],
     ) -> BriefingJobCreated:
         body = self._prepare_body(payload, GenerateFlightBriefingRequest)
-        response = self._request("POST", self.api_base_url, "/notams/briefing", body=body)
+        response = self._request(
+            "POST", self.api_base_url, "/notams/briefing", body=body, timeout=self.generation_timeout
+        )
         return BriefingJobCreated.model_validate(response)
 
     def create_briefing(
@@ -274,7 +394,15 @@ class NotamifyClient:
         return self.create_async_briefing(payload)
 
     def get_async_briefing_status(self, uuid: str) -> BriefingJobStatusDTO:
-        payload = self._request("GET", self.api_base_url, f"/notams/briefing/{uuid}")
+        """Return a briefing job. A failed job is returned with ``status == "failed"``, not raised."""
+        try:
+            payload = self._request("GET", self.api_base_url, f"/notams/briefing/{_path_id(uuid)}")
+        except APIError as exc:
+            # The API reports a failed job as HTTP 500 with the job as the body.
+            failed = exc.payload if isinstance(exc.payload, dict) else None
+            if exc.status == 500 and failed and failed.get("uuid") and failed.get("status") == "failed":
+                return BriefingJobStatusDTO.model_validate(failed)
+            raise
         return BriefingJobStatusDTO.model_validate(payload)
 
     def get_briefing_status(self, uuid: str) -> BriefingJobStatusDTO:
@@ -285,7 +413,9 @@ class NotamifyClient:
         payload: NotamPrioritisationRequest | Mapping[str, Any],
     ) -> NotamPrioritisationResult:
         body = self._prepare_body(payload, NotamPrioritisationRequest)
-        response = self._request("POST", self.api_base_url, "/notams/prioritisation", body=body)
+        response = self._request(
+            "POST", self.api_base_url, "/notams/prioritisation", body=body, timeout=self.generation_timeout
+        )
         return NotamPrioritisationResult.model_validate(response)
 
     def prioritise_notam(
@@ -301,6 +431,7 @@ class NotamifyClient:
         path: str,
         body: Mapping[str, Any] | None = None,
         query: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         if not self.token:
             raise APIError(0, "token is empty")
@@ -323,7 +454,7 @@ class NotamifyClient:
 
         req = request.Request(target_url, method=method, headers=headers, data=data)
         try:
-            with request.urlopen(req, timeout=self.timeout) as resp:
+            with request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 raw = resp.read()
                 if not raw:
                     return {}
@@ -342,6 +473,8 @@ class NotamifyClient:
             raise APIError(exc.code, str(message), payload)
         except error.URLError as exc:
             raise APIError(0, str(exc.reason), None)
+        except TimeoutError as exc:
+            raise APIError(0, f"request timed out: {exc}", None)
 
     def _prepare_query(self, payload: Mapping[str, Any] | BaseModel | None, schema: type[ModelT]) -> dict[str, Any]:
         if payload is None:
@@ -472,6 +605,8 @@ class NotamifyClient:
             return str(value.value)
         if isinstance(value, Mapping):
             return self._stringify_affected_element_filter(value)
+        if isinstance(value, BaseModel):
+            return self._stringify_affected_element_filter(value.model_dump(exclude_none=True))
         return str(value)
 
     def _stringify_affected_element_filter(self, value: Mapping[str, Any]) -> str:
@@ -502,3 +637,8 @@ class NotamifyClient:
     def _validate_positive_limit(self, name: str, value: int | None) -> None:
         if value is not None and value < 1:
             raise ValueError(f"{name} must be >= 1")
+
+
+def _path_id(value: str) -> str:
+    """Encode an identifier as one URL path segment."""
+    return quote(str(value).strip(), safe="")

@@ -335,6 +335,7 @@ class NotamScheduleInterpretationDTO(NotamifyModel):
 
 
 class NotamMapElementDTO(NotamifyModel):
+    id: str | None = None
     element_type: str
     coordinates: list[dict[str, Any]]
     description: str
@@ -366,6 +367,8 @@ class NotamDTO(NotamifyModel):
     is_permanent: bool
     message: str
     notam_type: str | None = None
+    referenced_notam_number: str | None = None
+    referenced_notam_id: str | None = None
     icao_code: str | None = None
     classification: str | None = None
     icao_message: str | None = None
@@ -378,6 +381,21 @@ class NotamListResult(NotamifyModel):
     total_count: int
     page: int
     per_page: int
+
+
+class RecentlyExpiredNotamDTO(NotamDTO):
+    expired_at: datetime | None = None
+    status: str | None = None
+
+
+class RecentlyExpiredNotamListResult(NotamListResult):
+    notams: list[RecentlyExpiredNotamDTO]
+
+
+class SimpleAirportBriefingResponse(NotamifyModel):
+    location: str
+    summary: str
+    notam_ids: list[str] = Field(default_factory=list)
 
 
 class AircraftDetails(NotamifyModel):
@@ -576,6 +594,23 @@ class HistoricalNotamsQuery(NotamifyModel):
     @classmethod
     def normalize_affected_element(cls, value: Any) -> Any:
         return _normalize_repeated_payload(value)
+
+
+class RecentlyExpiredNotamsQuery(NotamifyModel):
+    location: list[str] | None = None
+    expired_after: datetime | None = None
+    expired_before: datetime | None = None
+    excluded_classifications: list[str] | None = None
+    page: PageNumber | None = None
+    per_page: QueryPerPage | None = None
+
+
+class SimpleAirportBriefingQuery(NotamifyModel):
+    location: str
+    starts_at: datetime | date | None = None
+    ends_at: datetime | date | None = None
+    # The API spells the default verbosity "concile".
+    type: str | None = None
 
 
 class ErrorResponse(NotamifyModel):

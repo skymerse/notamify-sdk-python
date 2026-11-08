@@ -1,0 +1,43 @@
+# The `notamify` command. All code lives in notamify-sdk (notamify_sdk.cli);
+# this distribution only pins it and installs the console script, so that
+# `uv tool install notamify` and `uvx notamify` work.
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notamify"
+version = "0.4.0"
+description = "Notamify command line: NOTAMs, airport and flight briefings, and NOTAM Watcher, for people and AI agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+  {name = "Damian Szumski"}
+]
+keywords = ["notam", "aviation", "cli", "briefing", "agents"]
+classifiers = [
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Utilities"
+]
+# Released in lockstep with notamify-sdk; the release workflow checks the pin.
+dependencies = [
+  "notamify-sdk==0.4.0"
+]
+
+[project.scripts]
+notamify = "notamify_sdk.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/skymerse/notamify-sdk-python"
+Repository = "https://github.com/skymerse/notamify-sdk-python"
+Issues = "https://github.com/skymerse/notamify-sdk-python/issues"
+
+[tool.setuptools]
+packages = []
+
+# Local development: install the SDK from this checkout.
+[tool.uv.sources]
+notamify-sdk = { path = "..", editable = true }
