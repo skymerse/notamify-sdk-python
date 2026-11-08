@@ -69,15 +69,30 @@ class ConfigStore:
         return apply_environment(cfg)
 
     def save(self, cfg: SDKConfig) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        """Write the config, readable only by the current user (mode 0600) from the moment it exists.
+
+        The API key is stored in this file, as with other developer CLIs; NOTAMIFY_TOKEN avoids storing it.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         payload = {
             "api_base_url": cfg.api_base_url.strip(),
             "watcher_base_url": cfg.watcher_base_url.strip(),
             "base_url": cfg.watcher_base_url.strip(),
             "token": cfg.token.strip(),
         }
-        self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+        # Write a private temporary file and rename it over the config, so the key is never
+        # readable by others and a failed write never leaves a truncated config behind.
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
