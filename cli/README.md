@@ -1,6 +1,8 @@
 # notamify
 
-The Notamify command line: NOTAMs, affected infrastructure, airport and flight briefings, and NOTAM Watcher webhooks. It is built for people at a terminal and for AI coding agents (Claude Code, Codex and others) alike.
+**OpenClaw and agents ready.**
+
+The Notamify command line: NOTAMs, affected infrastructure, airport and flight briefings, and NOTAM Watcher webhooks. It is built for people at a terminal and for AI agents (Claude Code, Codex, OpenClaw and others) alike.
 
 ## Install
 

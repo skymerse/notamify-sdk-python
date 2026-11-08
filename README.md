@@ -1,5 +1,7 @@
 # notamify-sdk (Python)
 
+**OpenClaw and agents ready.** The `notamify` CLI ships an agent skill (`notamify skill install`) with OpenClaw metadata, prints JSON when piped, and uses stable exit codes, so Claude Code, Codex, OpenClaw and other agents can use it directly.
+
 Python SDK and command line for Notamify public APIs:
 
 - Notamify API v2 (`https://api.notamify.com/api/v2`)
