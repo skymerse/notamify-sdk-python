@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib import error, request
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from . import _callback_page as callback_page
 from .config import ConfigStore, write_private_json
 
 DEFAULT_MCP_URL = "https://mcp.notamify.com/mcp"
@@ -599,28 +600,33 @@ class _LoopbackCallback:
             def do_GET(self) -> None:
                 url = urlsplit(self.path)
                 if url.path != CALLBACK_PATH:
-                    self._page(HTTPStatus.NOT_FOUND, "Not found.")
+                    self._page(HTTPStatus.NOT_FOUND, "Not found.", content_type="text/plain")
                     return
                 params = {k: v[0] for k, v in parse_qs(url.query).items() if v}
                 # Requests without this login's state are not the browser coming back; ignore them.
                 if not secrets.compare_digest(params.get("state", ""), state):
-                    self._page(HTTPStatus.BAD_REQUEST, "<h1>This sign-in link is not for the current request</h1>")
+                    self._page(HTTPStatus.BAD_REQUEST, callback_page.render("mismatch"))
                     return
                 if "code" in params and "error" not in params:
-                    self._page(HTTPStatus.OK, "<h1>Signed in to Notamify</h1><p>You can close this tab and return to the terminal.</p>")
+                    self._page(HTTPStatus.OK, callback_page.render("success"))
+                elif params.get("error") == "access_denied":
+                    self._page(HTTPStatus.OK, callback_page.render("denied"))
                 else:
-                    self._page(HTTPStatus.OK, "<h1>Sign-in did not complete</h1><p>Return to the terminal for details.</p>")
+                    self._page(HTTPStatus.OK, callback_page.render("error"))
                 if not owner._done.is_set():
                     owner._result = params
                     owner._done.set()
 
-            def _page(self, status: HTTPStatus, html: str) -> None:
-                page = html.encode("utf-8")
+            def _page(self, status: HTTPStatus, body: str, content_type: str = "text/html") -> None:
+                page = body.encode("utf-8")
                 self.send_response(status)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", f"{content_type}; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Security-Policy", callback_page.CONTENT_SECURITY_POLICY)
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
                 self.end_headers()
                 self.wfile.write(page)
 

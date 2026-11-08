@@ -215,6 +215,37 @@ def parse_port(url):
     return urlsplit(redirect).port
 
 
+class CallbackPageTests(unittest.TestCase):
+    def test_pages_are_self_contained_and_locked_down(self):
+        from notamify_sdk import _callback_page as page
+
+        for kind in ("success", "denied", "error", "mismatch"):
+            with self.subTest(kind=kind):
+                html = page.render(kind)
+                self.assertNotIn("src=\"http", html)
+                self.assertIn("history.replaceState", html)
+        self.assertIn("You're signed in", page.render("success"))
+        self.assertIn("default-src 'none'", page.CONTENT_SECURITY_POLICY)
+        self.assertIn("frame-ancestors 'none'", page.CONTENT_SECURITY_POLICY)
+
+    def test_callback_serves_the_page_with_security_headers(self):
+        from urllib import error as urlerror, request as urlrequest
+        from notamify_sdk.account import _LoopbackCallback
+
+        callback = _LoopbackCallback(0, "expected-state")
+        try:
+            with urlrequest.urlopen(f"http://127.0.0.1:{callback.port}/callback?code=c&state=expected-state", timeout=5) as resp:
+                body = resp.read().decode()
+                self.assertIn("default-src 'none'", resp.headers["Content-Security-Policy"])
+                self.assertEqual(resp.headers["X-Frame-Options"], "DENY")
+            self.assertIn("You're signed in", body)
+            with self.assertRaises(urlerror.HTTPError) as ctx:
+                urlrequest.urlopen(f"http://127.0.0.1:{callback.port}/callback?code=c&state=other", timeout=5)
+            self.assertEqual(ctx.exception.code, 400)
+        finally:
+            callback.close()
+
+
 class McpTests(AccountTestCase):
     def test_structured_content_and_protocol_headers(self):
         self.login()
