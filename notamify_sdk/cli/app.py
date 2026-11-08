@@ -13,6 +13,7 @@ import getpass
 import json
 import os
 import queue
+import re
 import shlex
 import sys
 import time
@@ -190,23 +191,13 @@ def _add_time_window(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--hours", type=float, metavar="N", help="window length in hours from --start (instead of --end)")
 
 
-def _add_notam_filters(parser: argparse.ArgumentParser, *, qcode: bool = True, classification: bool = True) -> None:
+def _add_notam_filters(
+    parser: argparse.ArgumentParser, *, qcode: bool = True, classification: bool = True, interpretation: bool = True
+) -> None:
     group = parser.add_argument_group("filters")
     group.add_argument("--id", dest="notam_ids", action="append", metavar="NOTAM_ID", help="limit to Notamify NOTAM IDs")
-    group.add_argument(
-        "--category",
-        action="append",
-        type=str.upper,
-        metavar="CATEGORY",
-        help=f"interpretation category: {', '.join(CATEGORIES)}",
-    )
-    group.add_argument("--subcategory", action="append", metavar="SUBCATEGORY", help="interpretation subcategory")
-    group.add_argument(
-        "--affected",
-        action="append",
-        metavar="EFFECT[:TYPE]",
-        help="affected element filter, e.g. CLOSED:RUNWAY, CLOSED, :TAXIWAY",
-    )
+    if interpretation:
+        _add_interpretation_filters(group)
     if qcode:
         group.add_argument("--qcode", action="append", type=str.upper, metavar="QCODE", help="Q-code, e.g. QMRLC")
     if classification:
@@ -222,6 +213,23 @@ def _add_notam_filters(parser: argparse.ArgumentParser, *, qcode: bool = True, c
         "--no-est",
         action="store_true",
         help="leave out estimated-end (EST) NOTAMs whose estimated end has passed",
+    )
+
+
+def _add_interpretation_filters(group: Any) -> None:
+    group.add_argument(
+        "--category",
+        action="append",
+        type=str.upper,
+        metavar="CATEGORY",
+        help=f"interpretation category: {', '.join(CATEGORIES)}",
+    )
+    group.add_argument("--subcategory", action="append", metavar="SUBCATEGORY", help="interpretation subcategory")
+    group.add_argument(
+        "--affected",
+        action="append",
+        metavar="EFFECT[:TYPE]",
+        help="affected element filter, e.g. CLOSED:RUNWAY, CLOSED, :TAXIWAY (applied after paging)",
     )
 
 
@@ -248,7 +256,10 @@ def _add_paging(parser: argparse.ArgumentParser) -> None:
 
 def _add_flight(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("flight")
-    location_help = "ICAO@START/END, e.g. EPWA@2026-11-09T08:00Z/2026-11-09T10:00Z or EPWA@now/+2h"
+    location_help = (
+        "ICAO@START/END, e.g. EPWA@2026-11-09T08:00Z/2026-11-09T10:00Z or EPWA@now/+2h "
+        "(a relative START counts from now, a relative END from START)"
+    )
     group.add_argument("--origin", metavar="LOCATION", help=f"departure airport: {location_help}")
     group.add_argument("--destination", metavar="LOCATION", help="arrival airport, same format")
     group.add_argument("--alternate", action="append", metavar="LOCATION", help="alternate airport, repeatable")
@@ -358,7 +369,7 @@ def build_parser() -> Parser:
         )
         p.add_argument("locations", nargs="*", metavar="LOCATION", help="ICAO or 3-letter domestic codes, up to 5")
         _add_time_window(p)
-        _add_notam_filters(p)
+        _add_notam_filters(p, interpretation=name != "raw")
         _add_paging(p)
 
     p = _add_command(
@@ -478,7 +489,7 @@ def build_parser() -> Parser:
             credits="5",
             confirmation="always",
             examples=[
-                f"{PROG} briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+5h --aircraft B738 --yes --wait",
+                f"{PROG} briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+3h --aircraft B738 --yes --wait",
                 f"{PROG} briefing flight create --body request.json --yes",
             ],
         ),
@@ -518,7 +529,7 @@ def build_parser() -> Parser:
             "Rate one NOTAM's priority for a specific flight",
             credits="5",
             confirmation="always",
-            examples=[f"{PROG} prioritize NOTAM_ID --origin EPWA@now/+2h --destination EGLL@+2h/+5h --aircraft B738 --yes"],
+            examples=[f"{PROG} prioritize NOTAM_ID --origin EPWA@now/+2h --destination EGLL@+2h/+3h --aircraft B738 --yes"],
         ),
     )
     p.add_argument("notam_id", metavar="NOTAM_ID", help="Notamify NOTAM ID")
@@ -773,7 +784,15 @@ def _call(fn: Callable[[], Any]) -> Any:
     except APIError as exc:
         raise error_from_api(exc) from exc
     except ValidationError as exc:
-        raise CLIError("invalid_arguments", _validation_message(exc), EXIT_USAGE) from exc
+        # Request models are *Query / *Request; anything else is a response the API sent.
+        if exc.title.endswith(("Query", "Request")):
+            raise CLIError("invalid_arguments", _validation_message(exc), EXIT_USAGE) from exc
+        raise CLIError(
+            "invalid_response",
+            f"unexpected response from Notamify: {_validation_message(exc)}",
+            EXIT_ERROR,
+            "Update the CLI (uv tool upgrade notamify); if it persists, report it.",
+        ) from exc
 
 
 def _validation_message(exc: ValidationError) -> str:
@@ -826,15 +845,18 @@ def _list_notams(
         total = result.total_count
         batch = [n.model_dump(mode="json", by_alias=True) for n in result.notams]
         notams.extend(batch)
-        seen = (page - 1) * args.per_page + len(batch)
-        if not batch or seen >= total or len(batch) < args.per_page:
+        # total_count counts NOTAMs before category, subcategory and affected-element filters,
+        # which the API applies after paging: a short or empty page is not the end.
+        if page * args.per_page >= total:
             complete = True
             break
         page += 1
 
     fields = [f.strip() for f in (args.fields or "").split(",") if f.strip()]
+    filtered = any(query.get(k) for k in ("category", "subcategory", "affected_element"))
     body: dict[str, Any] = {
         "total_count": total,
+        "filtered_after_paging": filtered,
         "page": args.page,
         "per_page": args.per_page,
         "pages_fetched": pages_fetched,
@@ -852,8 +874,9 @@ def _list_notams(
 
 def _render_notam_list(data: Mapping[str, Any]) -> str:
     lines = [_render_notam_line(notam) for notam in data.get("notams", [])]
+    before_filters = " (before filters)" if data.get("filtered_after_paging") else ""
     lines.append(
-        f"\n{len(data.get('notams', []))} of {data.get('total_count', 0)} NOTAMs shown; "
+        f"\n{len(data.get('notams', []))} of {data.get('total_count', 0)}{before_filters} NOTAMs shown; "
         f"{data.get('pages_fetched', 0)} page(s), ~{data.get('credits_estimate', 0)} credit(s)."
         + ("" if data.get("complete") else f" More: --page {data.get('next_page')} or --all.")
     )
@@ -894,10 +917,10 @@ def _active_query(args: argparse.Namespace, *, require_location: bool) -> dict[s
             "notam_ids": args.notam_ids,
             "starts_at": start,
             "ends_at": end,
-            "category": args.category,
-            "subcategory": args.subcategory,
+            "category": getattr(args, "category", None),
+            "subcategory": getattr(args, "subcategory", None),
             "qcode": args.qcode,
-            "affected_element": _affected(args.affected),
+            "affected_element": _affected(getattr(args, "affected", None)),
             "excluded_classifications": args.exclude_classification,
             "always_include_est": False if args.no_est else None,
         }
@@ -983,7 +1006,7 @@ def cmd_notams_expired(ctx: Context) -> None:
 
 def cmd_notams_get(ctx: Context) -> None:
     notam_id = ctx.args.notam_id.strip()
-    if ctx.plan("GET", "api", f"/notams/{notam_id}", query={"add_popularity": False}, credits="1 credit"):
+    if ctx.plan("GET", "api", f"/notams/{notam_id}", credits="1 credit"):
         return
     notam = _call(lambda: ctx.client.get_notam(notam_id))
     ctx.out.emit(_envelope({"notam": notam}), lambda d: _render_notam_detail(to_jsonable(d["notam"])))
@@ -1108,7 +1131,7 @@ def _location_spec(value: str, location_type: str | None) -> dict[str, Any]:
         )
     raw_start, raw_end = window.split("/", 1)
     start = _time(raw_start)
-    end = _time(raw_end, end_of_day=True)
+    end = _time(raw_end, base=start, end_of_day=True)
     if end <= start:
         raise CLIError("invalid_arguments", f"{code}: window end must be after its start", EXIT_USAGE)
     return _drop_none({"location": code, "type": location_type, "starts_at": start, "ends_at": end})
@@ -1155,7 +1178,7 @@ def cmd_flight_create(ctx: Context) -> None:
     ctx.confirm(f"Creating a flight briefing for {route}", "5 credits")
     job = _call(lambda: ctx.client.create_async_briefing(body))
     if ctx.args.wait:
-        ctx.out.note(f"Briefing job {job.uuid} accepted; waiting…")
+        _announce_job(ctx, job.uuid)
         _wait_for_briefing(ctx, job.uuid)
         return
     ctx.out.emit(
@@ -1186,7 +1209,31 @@ def _uuid(value: str) -> str:
         raise CLIError("invalid_arguments", f"invalid briefing UUID {value!r}", EXIT_USAGE) from exc
 
 
+def _announce_job(ctx: Context, job_id: str) -> None:
+    """Report the accepted job before waiting, so it is never lost if waiting fails."""
+    if ctx.out.json:
+        ctx.out.stderr.write(json.dumps({"event": "briefing_accepted", "uuid": job_id}) + "\n")
+        ctx.out.stderr.flush()
+    else:
+        ctx.out.note(f"Briefing job {job_id} accepted; waiting… (check later: {PROG} briefing flight wait {job_id})")
+
+
 def _wait_for_briefing(ctx: Context, job_id: str) -> None:
+    try:
+        _poll_briefing(ctx, job_id)
+    except CLIError as exc:
+        exc.details.setdefault("uuid", job_id)
+        if exc.code not in ("briefing_failed",):
+            exc.remediation = (exc.remediation + " " if exc.remediation else "") + (
+                f"The job exists; do not create it again. Check it with `{PROG} briefing flight wait {job_id}`."
+            )
+        raise
+    except KeyboardInterrupt:
+        ctx.out.stderr.write(f"\nBriefing job {job_id} keeps running; check it with `{PROG} briefing flight wait {job_id}`.\n")
+        raise
+
+
+def _poll_briefing(ctx: Context, job_id: str) -> None:
     args = ctx.args
     deadline = time.monotonic() + max(args.wait_timeout, 0)
     interval = max(args.interval, 0.5)
@@ -1739,12 +1786,33 @@ def cmd_skill_install(ctx: Context) -> None:
 # Entry point --------------------------------------------------------------
 
 
+TIME_OPTIONS = {"--start", "--end", "--after", "--before"}
+_NEGATIVE_OFFSET = re.compile(r"^-\d+(?:\.\d+)?[mhd]$", re.I)
+
+
+def _join_negative_times(argv: list[str]) -> list[str]:
+    """Let `--after -3d` work: argparse would read -3d as an option."""
+    joined: list[str] = []
+    skip = False
+    for index, arg in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        nxt = argv[index + 1] if index + 1 < len(argv) else None
+        if arg in TIME_OPTIONS and nxt is not None and _NEGATIVE_OFFSET.match(nxt):
+            joined.append(f"{arg}={nxt}")
+            skip = True
+        else:
+            joined.append(arg)
+    return joined
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     out = Output(detect_mode(argv))
     parser = build_parser()
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(_join_negative_times(argv))
         out.mode = getattr(args, "output", None) or out.mode
         ctx = Context(args, out, argv)
         args.handler(ctx)

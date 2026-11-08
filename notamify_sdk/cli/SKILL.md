@@ -35,7 +35,7 @@ You retrieve and explain NOTAMs for pilots, dispatchers and aviation teams by ru
 | NOTAMs valid on a past date | `notamify notams archive EDDF --date 2025-09-20` | 1 per page |
 | NOTAMs that recently stopped being active | `notamify notams expired EPWA --after -3d` | 1 per page |
 | Quick airport briefing | `notamify briefing airport EPWA --yes` | 2 |
-| Flight briefing between airports | `notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+5h --aircraft B738 --yes --wait` | 5 |
+| Flight briefing between airports | `notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+3h --aircraft B738 --yes --wait` | 5 |
 | How important one NOTAM is for a flight | `notamify prioritize NOTAM_ID --origin ... --destination ... --yes` | 5 |
 | Watcher listeners, deliveries, webhook secret | `notamify watcher listeners list`, `notamify watcher logs` | free |
 

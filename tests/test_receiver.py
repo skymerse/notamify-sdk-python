@@ -47,6 +47,17 @@ class ReceiverTests(unittest.TestCase):
         finally:
             dev_receiver.stop()
 
+    def test_receiver_rejects_json_that_is_not_an_object(self):
+        receiver, base_url = self._start_receiver(secret="", require_signature=True, allow_unsigned_dev=True)
+        try:
+            req = request.Request(f"{base_url}/", method="POST", data=b"[]", headers={"Content-Type": "application/json"})
+            with self.assertRaises(error.HTTPError) as ctx:
+                request.urlopen(req, timeout=2)
+            self.assertEqual(ctx.exception.code, 400)
+            self.assertIsNone(receiver.last_event)
+        finally:
+            receiver.stop()
+
     def test_receiver_rejects_unsigned_when_strict(self):
         receiver, base_url = self._start_receiver(secret="sec", require_signature=True)
         try:

@@ -78,10 +78,25 @@ jobs:
           name: release-dists
           path: dist
 
-      - name: Publish to PyPI
+      # notamify pins notamify-sdk==<version>, so the SDK must be on PyPI first.
+      - name: Split distributions
+        run: |
+          mkdir -p dist-sdk dist-cli
+          mv dist/notamify_sdk-* dist-sdk/
+          mv dist/notamify-* dist-cli/
+          ls dist-sdk dist-cli
+
+      - name: Publish notamify-sdk to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: dist-sdk
+          skip-existing: true
+
+      - name: Publish notamify to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-cli
+          skip-existing: true
 
   github-release:
     needs:

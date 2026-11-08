@@ -40,7 +40,7 @@ class CLITestCase(unittest.TestCase):
         self.env = mock.patch.dict(
             os.environ,
             {
-                "NOTAMIFY_TOKEN": "nmf_sk_test",
+                "NOTAMIFY_TOKEN": "test-api-key",
                 "NOTAMIFY_API_BASE_URL": self.api.url,
                 "NOTAMIFY_WATCHER_BASE_URL": self.api.url,
                 "NOTAMIFY_CONFIG_FILE": str(self.config),
@@ -153,6 +153,63 @@ class NotamCommandTests(CLITestCase):
         self.assertTrue(data["complete"])
         _, data, _ = self.run_json("affected", "EPWA", "--fields", "identifier,effect")
         self.assertEqual(data["elements"][0], {"identifier": "11/29", "effect": "CLOSED"})
+
+
+class ReviewRegressionTests(CLITestCase):
+    def test_filtered_short_page_is_not_complete(self):
+        # The API filters by category and affected element after paging; total_count is before filters.
+        def page(req):
+            n = int(req.query["page"][0])
+            items = [sample_notam(f"00000000-0000-0000-0000-{n:012d}")] if n == 1 else []
+            return 200, {"notams": items, "total_count": 90, "page": n, "per_page": 30}
+
+        self.api.route("GET", "/notams", page)
+        code, data, _ = self.run_json("notams", "active", "EGLL", "--affected", "CLOSED:RUNWAY")
+        self.assertEqual(code, 0)
+        self.assertFalse(data["complete"])
+        self.assertEqual(data["next_page"], 2)
+        self.assertTrue(data["filtered_after_paging"])
+        code, data, _ = self.run_json("notams", "active", "EGLL", "--category", "aerodrome", "--all", "--yes")
+        self.assertEqual((data["pages_fetched"], data["complete"]), (3, True))
+
+    def test_wait_failure_keeps_the_job_uuid(self):
+        self.api.route("POST", "/notams/briefing", (201, {"uuid": JOB, "status": "pending", "status_url": "/x"}))
+        self.api.route("GET", f"/notams/briefing/{JOB}", (503, {"error": "unavailable"}))
+        code, _, err = self.run_cli(
+            "briefing", "flight", "create", "--origin", "EPWA@2026-11-09T08:00Z/2026-11-09T10:00Z", "--yes", "--wait"
+        )
+        self.assertEqual(code, 7)
+        lines = [json.loads(line) for line in err.splitlines()]
+        self.assertEqual(lines[0], {"event": "briefing_accepted", "uuid": JOB})
+        self.assertEqual(lines[-1]["error"]["uuid"], JOB)
+        self.assertIn("do not create it again", lines[-1]["error"]["remediation"])
+
+    def test_negative_relative_times_and_now(self):
+        self.api.route("GET", "/notams/recently-expired", (200, {"notams": [], "total_count": 0, "page": 1, "per_page": 30}))
+        code, _, err = self.run_json("notams", "expired", "EPWA", "--after", "-3d")
+        self.assertEqual(code, 0, err)
+        self.api.route("GET", "/notams", paged_notams(0))
+        code, _, err = self.run_json("notams", "active", "EPWA", "--start", "-2h", "--end", "now")
+        self.assertEqual(code, 0, err)
+
+    def test_location_end_counts_from_its_start(self):
+        code, data, err = self.run_json(
+            "briefing", "flight", "create", "--origin", "EPWA@2026-12-20T08:00Z/+2h", "--dry-run"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(data["request"]["body"]["locations"][0]["ends_at"], "2026-12-20T10:00:00Z")
+
+    def test_unexpected_response_is_not_a_usage_error(self):
+        self.api.route("GET", "/listeners", (200, {"listeners": [{"id": "l1", "mode": "shadow"}]}))
+        code, _, err = self.run_json("watcher", "listeners", "list")
+        self.assertEqual((code, err["error"]["code"]), (1, "invalid_response"))
+        self.api.route("GET", "/notams", (200, "<html>proxy</html>"))
+        code, _, err = self.run_json("notams", "active", "EPWA")
+        self.assertEqual((code, err["error"]["code"]), (7, "invalid_response"))
+
+    def test_raw_has_no_interpretation_filters(self):
+        code, _, err = self.run_json("notams", "raw", "EPWA", "--category", "AERODROME")
+        self.assertEqual(code, 2)
 
 
 class ErrorTests(CLITestCase):
@@ -300,7 +357,7 @@ class LocalCommandTests(CLITestCase):
             self.assertEqual(code, 3)
             self.assertFalse(data["authenticated"])
 
-            code, data, _ = self.run_json("auth", "login", "--token-stdin", stdin="nmf_sk_abcdefghijklmnop\n")
+            code, data, _ = self.run_json("auth", "login", "--token-stdin", stdin="test-api-key-abcdefghijklmnop\n")
             self.assertEqual(code, 0)
             self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
             self.assertNotIn("abcdefghijklmnop", json.dumps(data))
@@ -404,7 +461,8 @@ class ParseTimeTests(unittest.TestCase):
         self.assertEqual(parse_time("2026-11-09T10:00"), datetime(2026, 11, 9, 10, tzinfo=timezone.utc))
         self.assertEqual(parse_time("2026-11-09"), datetime(2026, 11, 9, tzinfo=timezone.utc))
         self.assertEqual(parse_time("2026-11-09", end_of_day=True), datetime(2026, 11, 9, 23, 59, 59, tzinfo=timezone.utc))
-        self.assertEqual(parse_time("now", base=self.base), self.base)
+        # "now" is always the current time; only offsets count from base.
+        self.assertLess(abs((parse_time("now", base=self.base) - datetime.now(timezone.utc)).total_seconds()), 5)
         self.assertEqual(parse_time("+6h", base=self.base), datetime(2026, 11, 8, 18, tzinfo=timezone.utc))
         self.assertEqual(parse_time("-30m", base=self.base), datetime(2026, 11, 8, 11, 30, tzinfo=timezone.utc))
         self.assertEqual(parse_time("+2d", base=self.base), datetime(2026, 11, 10, 12, tzinfo=timezone.utc))

@@ -1,8 +1,8 @@
 """The SDK must cover everything the public API spec exposes.
 
-The public OpenAPI document intentionally leaves out some response detail, so
-this checks one direction only: every documented operation, query parameter
-and response field is reachable through the SDK. Extra SDK fields are expected.
+This checks one direction only: every documented operation, query parameter
+and response field is reachable through the SDK. The SDK may model fields the
+document does not list.
 
 tests/fixtures/openapi.json is a copy of https://api.notamify.com/api/v2/openapi.json.
 Refresh it with `make spec`; set NOTAMIFY_SPEC_LIVE=1 to check the live document.

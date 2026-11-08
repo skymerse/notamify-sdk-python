@@ -296,7 +296,7 @@ class ModelTests(unittest.TestCase):
             )
 
     def test_sandbox_delivery_without_kind_or_event_id(self):
-        # Shape of internal/listeners/webhook.go SendSandbox: no kind, no event_id, null location.
+        # Sandbox test delivery: no kind, no event_id, null location.
         model = WatcherWebhookEvent.model_validate(
             {
                 "listener_id": "listener-1",
@@ -341,8 +341,8 @@ class ModelTests(unittest.TestCase):
                     "type": "RUNWAY",
                     "subtype": "LENGTH",
                     "identifier": "11/29",
-                    "applies_to": {"aircraft": {"wingspan_m": {"gt": 36}}},
-                    "changes": [{"subject": "LENGTH", "to": {"lt": 2500}}],
+                    "applies_to": {"operation_phase": ["LANDING"]},
+                    "changes": [{"subject": "LENGTH", "to": {"operator": "lt", "value": 2500, "unit": "M"}}],
                     "future_option": True,
                 }
             ],

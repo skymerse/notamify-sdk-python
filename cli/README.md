@@ -41,7 +41,7 @@ notamify notams active EPWA EGLL --start now --hours 24
 notamify affected EPWA --affected CLOSED:RUNWAY
 notamify notams get NOTAM_ID
 notamify briefing airport EPWA
-notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+5h --aircraft B738 --wait
+notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+3h --aircraft B738 --wait
 notamify watcher listeners list
 notamify webhook listen --tunnel
 notamify commands             # every command, its credit cost and the exit codes

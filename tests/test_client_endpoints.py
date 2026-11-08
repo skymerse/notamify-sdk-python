@@ -44,12 +44,12 @@ class EndpointTests(unittest.TestCase):
         self.api.route("GET", "/notams/recently-expired", paged_notams(35))
         self.assertEqual(len(list(self.client.notams.recently_expired({"location": ["EPWA"]}, per_page=30))), 35)
 
-    def test_get_notam_does_not_count_popularity(self):
+    def test_get_notam(self):
         notam_id = "11111111-1111-1111-1111-111111111111"
         self.api.route("GET", f"/notams/{notam_id}", (200, sample_notam(notam_id)))
         notam = self.client.get_notam(notam_id)
         self.assertEqual(notam.id, notam_id)
-        self.assertEqual(self.api.last("GET", f"/notams/{notam_id}").query["add_popularity"], ["false"])
+        self.assertEqual(self.api.last("GET", f"/notams/{notam_id}").query, {})
 
     def test_get_notam_encodes_the_id(self):
         with self.assertRaises(APIError):
@@ -128,6 +128,25 @@ class ClientConfigTests(unittest.TestCase):
             Path(handle.name).write_text("{not json")
             self.assertEqual(NotamifyClient().token, "env-token")
         os.unlink(handle.name)
+
+    def test_explicit_token_keeps_production_defaults(self):
+        with mock.patch.dict(os.environ, {"NOTAMIFY_API_BASE_URL": "https://staging.example.test/v2"}):
+            client = NotamifyClient(token="explicit")
+        self.assertEqual(client.api_base_url, "https://api.notamify.com/api/v2")
+
+    def test_pager_does_not_stop_on_a_filtered_short_page(self):
+        api = FakeAPI().start()
+        try:
+            def page(req):
+                n = int(req.query["page"][0])
+                items = [sample_notam(f"00000000-0000-0000-0000-{n:012d}")] if n in (1, 3) else []
+                return 200, {"notams": items, "total_count": 75, "page": n, "per_page": 30}
+
+            api.route("GET", "/notams", page)
+            client = NotamifyClient(token="t", api_base_url=api.url, watcher_base_url=api.url)
+            self.assertEqual(len(list(client.notams.active({"location": ["EGLL"], "category": ["AERODROME"]}, per_page=30))), 2)
+        finally:
+            api.stop()
 
     def test_explicit_token_wins(self):
         with mock.patch.dict(os.environ, {"NOTAMIFY_TOKEN": "env-token"}):

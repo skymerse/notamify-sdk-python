@@ -79,6 +79,10 @@ def error_from_api(exc: APIError) -> CLIError:
                 f"Set NOTAMIFY_TOKEN, or run `notamify auth login`. Create a key at {API_KEYS_URL}.",
             )
         return CLIError("network_error", message or "network error", EXIT_TEMPORARY, "Check connectivity and retry.")
+    if 200 <= status < 400:
+        return CLIError(
+            "invalid_response", message or "unexpected response", EXIT_TEMPORARY, "Retry; a proxy or network may be interfering."
+        )
     if status == 401:
         return CLIError(
             "auth_invalid",
@@ -257,7 +261,7 @@ def parse_time(value: str, *, base: datetime | None = None, end_of_day: bool = F
     lowered = text.lower()
     reference = base or now_utc()
     if lowered == "now":
-        return reference
+        return now_utc()
     match = _RELATIVE.match(lowered)
     if match:
         sign, amount, unit = match.groups()

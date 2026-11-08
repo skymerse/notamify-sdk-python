@@ -28,7 +28,7 @@ notamify --version
 notamify auth login                                    # API key from https://notamify.com/api-manager
 notamify notams active EPWA EGLL --start now --hours 24
 notamify affected EPWA --affected CLOSED:RUNWAY
-notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+5h --aircraft B738 --wait
+notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+3h --aircraft B738 --wait
 notamify watcher listeners list
 notamify webhook listen --tunnel
 notamify commands                                      # every command, credit cost and exit code
@@ -234,7 +234,7 @@ make spec                        # refresh tests/fixtures/openapi.json from the 
 uv tool install --editable ./cli # put this checkout's `notamify` command on PATH
 ```
 
-`tests/test_spec_coverage.py` checks that the SDK covers every operation, parameter and field in the public OpenAPI document. The public document intentionally omits some detail, so the SDK may model more than it shows; the check only fails when the SDK is missing something the document has.
+`tests/test_spec_coverage.py` checks that the SDK covers every operation, parameter and field in the public OpenAPI document. The SDK may model fields the document does not list; the check only fails when the SDK is missing something the document has.
 
 ### Releasing
 
