@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "notamify-sdk"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python SDK for Notamify APIs"
 readme = "README.md"
 license = "MIT"
@@ -37,6 +37,9 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["notamify_sdk*", "notamify_watcher_sdk*"]
+
+[tool.setuptools.package-data]
+"notamify_sdk.cli" = ["SKILL.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

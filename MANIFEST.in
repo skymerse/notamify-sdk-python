@@ -1,1 +1,2 @@
 recursive-include examples *.md *.py
+include notamify_sdk/cli/SKILL.md

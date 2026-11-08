@@ -117,7 +117,9 @@ class WebhookReceiver:
 
                 try:
                     body = json.loads(raw.decode("utf-8"))
-                except json.JSONDecodeError:
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    body = None
+                if not isinstance(body, dict):
                     self.send_response(HTTPStatus.BAD_REQUEST)
                     self.end_headers()
                     return

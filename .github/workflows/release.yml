@@ -29,14 +29,18 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Ensure tag matches package version
+      - name: Ensure tag matches package versions
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGE_VERSION="$(grep -E '^version = ' pyproject.toml | head -n1 | sed -E 's/version = "([^"]+)"/\1/')"
-          if [ "${TAG_VERSION}" != "${PACKAGE_VERSION}" ]; then
-            echo "::error::Git tag ${TAG_VERSION} does not match pyproject version ${PACKAGE_VERSION}"
-            exit 1
-          fi
+          SDK_VERSION="$(grep -E '^version = ' pyproject.toml | head -n1 | sed -E 's/version = "([^"]+)"/\1/')"
+          CLI_VERSION="$(grep -E '^version = ' cli/pyproject.toml | head -n1 | sed -E 's/version = "([^"]+)"/\1/')"
+          CLI_PIN="$(grep -Eo 'notamify-sdk==[^"]+' cli/pyproject.toml | cut -d= -f3)"
+          for pair in "notamify-sdk:${SDK_VERSION}" "notamify:${CLI_VERSION}" "notamify-sdk pin in cli/pyproject.toml:${CLI_PIN}"; do
+            if [ "${TAG_VERSION}" != "${pair##*:}" ]; then
+              echo "::error::Git tag ${TAG_VERSION} does not match ${pair%:*} version ${pair##*:}"
+              exit 1
+            fi
+          done
 
       - name: Sync environment
         run: uv sync --python 3.13
@@ -45,7 +49,7 @@ jobs:
         run: uv run python -m unittest discover -s tests -p 'test_*.py'
 
       - name: Build distributions
-        run: uv build
+        run: make build
 
       - name: Check distributions
         run: uvx --from twine twine check dist/*
@@ -54,7 +58,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-dists
-          path: dist/notamify_sdk-*
+          path: |
+            dist/notamify_sdk-*
+            dist/notamify-*
           if-no-files-found: error
 
   publish-pypi:
@@ -72,10 +78,25 @@ jobs:
           name: release-dists
           path: dist
 
-      - name: Publish to PyPI
+      # notamify pins notamify-sdk==<version>, so the SDK must be on PyPI first.
+      - name: Split distributions
+        run: |
+          mkdir -p dist-sdk dist-cli
+          mv dist/notamify_sdk-* dist-sdk/
+          mv dist/notamify-* dist-cli/
+          ls dist-sdk dist-cli
+
+      - name: Publish notamify-sdk to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: dist-sdk
+          skip-existing: true
+
+      - name: Publish notamify to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-cli
+          skip-existing: true
 
   github-release:
     needs:

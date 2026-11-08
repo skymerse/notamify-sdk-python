@@ -67,14 +67,29 @@ class ListenerMetadata(NotamifyModel):
 
 
 class ListenerTimeWindowFilter(NotamifyModel):
+    """A recurring (``days``/``start``/``end``) or absolute (``start_at``/``end_at``) delivery window."""
+
+    # Unknown keys are kept so that new Watcher filter options are never silently dropped.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    type: str | None = None
     days: list[str] | None = None
     start: str | None = None
     end: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
 
 
 class ListenerAffectedElementFilter(NotamifyModel):
+    # Unknown keys are kept so that new Watcher filter options are never silently dropped.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     effect: str | None = None
     type: str | None = None
+    subtype: str | None = None
+    identifier: str | None = None
+    applies_to: dict[str, Any] | None = None
+    changes: list[dict[str, Any]] | None = None
 
 
 class ListenerFilters(NotamifyModel):
@@ -84,6 +99,9 @@ class ListenerFilters(NotamifyModel):
     notam_icao: list[str] | None = None
     notam_type: list[str] | None = None
     airport_type: list[str] | None = None
+    aircraft_type: list[str] | None = None
+    aircraft_designator: list[str] | None = None
+    aircraft_family: list[str] | None = None
     category: list[str] | None = None
     subcategory: list[str] | None = None
     qcode: list[str] | None = None
@@ -335,6 +353,7 @@ class NotamScheduleInterpretationDTO(NotamifyModel):
 
 
 class NotamMapElementDTO(NotamifyModel):
+    id: str | None = None
     element_type: str
     coordinates: list[dict[str, Any]]
     description: str
@@ -366,6 +385,8 @@ class NotamDTO(NotamifyModel):
     is_permanent: bool
     message: str
     notam_type: str | None = None
+    referenced_notam_number: str | None = None
+    referenced_notam_id: str | None = None
     icao_code: str | None = None
     classification: str | None = None
     icao_message: str | None = None
@@ -378,6 +399,21 @@ class NotamListResult(NotamifyModel):
     total_count: int
     page: int
     per_page: int
+
+
+class RecentlyExpiredNotamDTO(NotamDTO):
+    expired_at: datetime | None = None
+    status: str | None = None
+
+
+class RecentlyExpiredNotamListResult(NotamListResult):
+    notams: list[RecentlyExpiredNotamDTO]
+
+
+class SimpleAirportBriefingResponse(NotamifyModel):
+    location: str
+    summary: str
+    notam_ids: list[str] = Field(default_factory=list)
 
 
 class AircraftDetails(NotamifyModel):
@@ -501,13 +537,27 @@ class WebhookLifecycleChange(NotamifyModel):
 
 
 class WatcherWebhookEvent(NotamifyModel):
+    """A Watcher webhook delivery.
+
+    Production NOTAM deliveries have ``kind``, ``event_id`` and ``notam``. Sandbox test
+    deliveries have ``notam`` but no ``kind`` or ``event_id``. When the account runs out of
+    credits, Watcher sends a notice with only ``listener_id``, ``sent_at`` and ``error``.
+    ``context.location`` can be null.
+    """
+
     listener_id: str
-    kind: WebhookMessageKind
-    event_id: str
-    notam: NotamDTO
     sent_at: datetime
+    kind: WebhookMessageKind | None = None
+    event_id: str | None = None
+    notam: NotamDTO | None = None
     change: WebhookLifecycleChange | None = None
     context: WebhookContext | None = None
+    error: str | None = None
+
+    @property
+    def is_error(self) -> bool:
+        """True for a notice (such as credits exhausted) that carries no NOTAM."""
+        return self.error is not None and self.notam is None
 
     @model_validator(mode="after")
     def validate_change_payload(self) -> "WatcherWebhookEvent":
@@ -576,6 +626,23 @@ class HistoricalNotamsQuery(NotamifyModel):
     @classmethod
     def normalize_affected_element(cls, value: Any) -> Any:
         return _normalize_repeated_payload(value)
+
+
+class RecentlyExpiredNotamsQuery(NotamifyModel):
+    location: list[str] | None = None
+    expired_after: datetime | None = None
+    expired_before: datetime | None = None
+    excluded_classifications: list[str] | None = None
+    page: PageNumber | None = None
+    per_page: QueryPerPage | None = None
+
+
+class SimpleAirportBriefingQuery(NotamifyModel):
+    location: str
+    starts_at: datetime | date | None = None
+    ends_at: datetime | date | None = None
+    # The API spells the default verbosity "concile".
+    type: str | None = None
 
 
 class ErrorResponse(NotamifyModel):

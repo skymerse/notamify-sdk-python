@@ -295,6 +295,62 @@ class ModelTests(unittest.TestCase):
                 }
             )
 
+    def test_sandbox_delivery_without_kind_or_event_id(self):
+        # Sandbox test delivery: no kind, no event_id, null location.
+        model = WatcherWebhookEvent.model_validate(
+            {
+                "listener_id": "listener-1",
+                "notam": {
+                    "id": "n1",
+                    "notam_number": "A0001/26",
+                    "location": "ZZZZ",
+                    "starts_at": "2026-02-25T10:00:00Z",
+                    "ends_at": "2026-02-26T10:00:00Z",
+                    "issued_at": "2026-02-25T09:00:00Z",
+                    "is_estimated": False,
+                    "is_permanent": False,
+                    "message": "SANDBOX",
+                },
+                "context": {"location": None},
+                "sent_at": "2026-03-06T12:00:00Z",
+            }
+        )
+        self.assertIsNone(model.kind)
+        self.assertIsNone(model.event_id)
+        self.assertIsNone(model.context.location)
+        self.assertFalse(model.is_error)
+
+    def test_credits_exhausted_notice(self):
+        model = WatcherWebhookEvent.model_validate(
+            {"listener_id": "listener-1", "sent_at": "2026-03-06T12:00:00Z", "error": "Insufficient credits"}
+        )
+        self.assertTrue(model.is_error)
+        self.assertIsNone(model.notam)
+
+    def test_listener_filters_keep_every_watcher_filter_field(self):
+        filters = {
+            "notam_icao": ["EPWA"],
+            "aircraft_type": ["B738"],
+            "time_windows": [
+                {"type": "absolute", "start_at": "2026-11-09T08:00:00Z", "end_at": "2026-11-09T12:00:00Z"},
+                {"days": ["MON"], "start": "08:00", "end": "12:00"},
+            ],
+            "affected_element": [
+                {
+                    "effect": "RESTRICTED",
+                    "type": "RUNWAY",
+                    "subtype": "LENGTH",
+                    "identifier": "11/29",
+                    "applies_to": {"operation_phase": ["LANDING"]},
+                    "changes": [{"subject": "LENGTH", "to": {"operator": "lt", "value": 2500, "unit": "M"}}],
+                    "future_option": True,
+                }
+            ],
+        }
+        request = ListenerRequest.model_validate({"webhook_url": "https://example.com", "filters": filters})
+        dumped = request.model_dump(mode="json", exclude_none=True)["filters"]
+        self.assertEqual(dumped, filters)
+
 
 if __name__ == "__main__":
     unittest.main()
