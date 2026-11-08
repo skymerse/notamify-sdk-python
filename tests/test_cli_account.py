@@ -98,7 +98,7 @@ class AccountCommandTests(AccountCLITestCase):
         self.assertEqual(code, 4)
         self.assertEqual(err["error"]["credits_estimate"], "up to 3 credits (1 per page), account rate")
 
-    def test_flight_briefing_retry_reuses_the_idempotency_key(self):
+    def test_flight_briefing_idempotency_keys(self):
         self.account.tool("create_flight_briefing", {"uuid": JOB, "status_url": "/x", "mcp_billing": BILLING})
         argv = ["briefing", "flight", "create", "--origin", "EPWA@2026-11-09T08:00Z/2026-11-09T10:00Z",
                 "--destination", "EGLL@2026-11-09T10:30Z/2026-11-09T13:00Z", "--aircraft", "B738"]
@@ -107,10 +107,60 @@ class AccountCommandTests(AccountCLITestCase):
         self.assertEqual(err["error"]["credits_estimate"], "1 credit, account rate")
         self.run_json(*argv, "--yes")
         self.run_json(*argv, "--yes")
+        self.run_json(*argv, "--yes", "--idempotency-key", "retry-1")
         keys = [args["idempotency_key"] for name, args in self.account.tool_calls if name == "create_flight_briefing"]
-        self.assertEqual(len(keys), 2)
-        self.assertEqual(keys[0], keys[1])
+        # A new key per run (a failed request's key stays reserved); an explicit key is sent as given.
+        self.assertEqual(len(keys), 3)
+        self.assertNotEqual(keys[0], keys[1])
         self.assertTrue(keys[0].startswith("cli-"))
+        self.assertEqual(keys[2], "retry-1")
+        body = self.account.tool_calls[0][1]
+        self.assertEqual(body["locations"][0]["starts_at"], "2026-11-09T08:00:00Z")
+
+    def test_polling_waits_out_the_rate_limit(self):
+        calls = {"n": 0}
+
+        def status(args):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ToolFailure("Notamify usage limit reached. Retry in 1 seconds.")
+            return {"uuid": args["briefing_id"], "status": "completed", "created_at": "2026-11-08T10:00:00Z", "updated_at": "2026-11-08T10:01:00Z"}
+
+        self.account.tool("get_flight_briefing", status)
+        code, data, err = self.run_json("briefing", "flight", "wait", JOB, "--wait-timeout", "30")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(data["job"]["status"], "completed")
+
+    def test_rate_limited_pagination_returns_the_pages_already_paid_for(self):
+        def search(args):
+            if args["page"] == 2:
+                raise ToolFailure("Notamify usage limit reached. Retry in 120 seconds.")
+            return {"notams": [summarized(sample_notam())] * 30, "total_count": 90, "page": args["page"], "per_page": 30, "mcp_billing": BILLING}
+
+        self.account.tool("search_active_notams", search)
+        code, data, err = self.run_json("notams", "active", "EPWA", "--all", "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((len(data["notams"]), data["complete"], data["next_page"]), (30, False, 2))
+        self.assertEqual(data["stopped"], {"reason": "rate_limited", "retry_after": 120})
+
+    def test_auth_env_accepts_both_spellings(self):
+        self.api.route("GET", "/notams", paged_notams(1))
+        with mock.patch.dict(os.environ, {"NOTAMIFY_AUTH": "api_key", "NOTAMIFY_TOKEN": ""}):
+            self.config.write_text('{"token": "test-api-key"}')
+            code, data, err = self.run_json("notams", "active", "EPWA")
+            self.assertEqual((code, data["auth"]), (0, "api_key"), err)
+            code, data, _ = self.run_json("auth", "status")
+            self.assertEqual(data["notams_and_briefings"], "api_key")
+
+    def test_other_server_url_does_not_get_the_session(self):
+        other = FakeAccountServer().start()
+        try:
+            with mock.patch.dict(os.environ, {"NOTAMIFY_MCP_URL": other.mcp_url}):
+                code, _, err = self.run_json("notams", "get", "11111111-1111-1111-1111-111111111111")
+            self.assertEqual((code, err["error"]["code"]), (3, "not_signed_in"))
+            self.assertEqual([r for r in other.api.requests if r.path in ("/mcp", "/oauth/token")], [])
+        finally:
+            other.stop()
 
     def test_wait_polls_get_flight_briefing(self):
         states = iter(["processing", "failed"])

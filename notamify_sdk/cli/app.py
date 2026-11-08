@@ -26,10 +26,11 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from pydantic import ValidationError
 
-from ..account import SCOPES, AccountAuth, AccountError, AccountStore, McpClient
+from ..account import DEFAULT_MCP_URL, SCOPES, AccountAuth, AccountError, AccountStore, McpClient
 from ..client import SDK_VERSION, APIError, NotamifyClient
 from ..cloudflared import CloudflaredError, CloudflaredManager
 from ..config import ConfigStore, SDKConfig
+from ..models import GenerateFlightBriefingRequest
 from ..receiver import ReceivedEvent, ReceiverConfig, WebhookReceiver
 from .backends import (
     ACCOUNT_TOOLS,
@@ -158,7 +159,7 @@ def _action_options() -> argparse.ArgumentParser:
     )
     group.add_argument(
         "--auth",
-        choices=["auto", "account", "api-key"],
+        choices=["auto", "account", "api-key", "api_key"],
         default=argparse.SUPPRESS,
         help="sign-in to use; auto prefers NOTAMIFY_TOKEN, then your account, then a stored key (also NOTAMIFY_AUTH)",
     )
@@ -541,8 +542,8 @@ def build_parser() -> Parser:
     p.add_argument(
         "--idempotency-key",
         metavar="KEY",
-        help="account sign-in only: retries with the same key return the accepted job without a new charge "
-        "(default: derived from the request)",
+        help="account sign-in only: reuse a key to retry the same request without a second charge "
+        "(default: a new key per run)",
     )
     p.add_argument("--wait-timeout", type=float, default=300, metavar="SECONDS", help="give up waiting after this long (default 300)")
     p.add_argument("--interval", type=float, default=3, metavar="SECONDS", help="poll interval (default 3)")
@@ -739,36 +740,8 @@ class Context:
         return self._client
 
     def backend(self, operation: str) -> Backend:
-        """Pick API key or account for a NOTAM or briefing operation.
-
-        auto: NOTAMIFY_TOKEN wins, then a signed-in account, then a stored API key.
-        """
-        choice = getattr(self.args, "auth", None) or os.getenv("NOTAMIFY_AUTH", "").strip().lower() or "auto"
-        if choice not in ("auto", "account", "api-key"):
-            raise CLIError("invalid_arguments", f"invalid auth {choice!r}; use auto, account or api-key", EXIT_USAGE)
-        signed_in = AccountStore().load() is not None
-        if choice == "auto":
-            if _env_token():
-                choice = "api-key"
-            elif signed_in and operation in ACCOUNT_TOOLS:
-                choice = "account"
-            elif _api_key_available():
-                choice = "api-key"
-            elif signed_in:
-                raise requires_api_key(operation)
-            else:
-                raise CLIError(
-                    "auth_missing",
-                    "Not signed in and no API key is configured.",
-                    EXIT_AUTH,
-                    f"Run `{PROG} auth login` to sign in with your Notamify account, "
-                    f"or `{PROG} auth login --api-key` / set NOTAMIFY_TOKEN to use an API key.",
-                )
-        if choice == "account":
-            if operation not in ACCOUNT_TOOLS:
-                raise requires_api_key(operation)
-            if not signed_in and not self.dry_run:
-                raise CLIError("not_signed_in", "Not signed in to a Notamify account.", EXIT_AUTH, f"Run `{PROG} auth login`.")
+        """Pick API key or account for a NOTAM or briefing operation (see select_auth)."""
+        choice = select_auth(getattr(self.args, "auth", None), operation, dry_run=self.dry_run)
         key = "account" if choice == "account" else "api_key"
         if key not in self._backends:
             self._backends[key] = AccountBackend() if key == "account" else ApiKeyBackend(self._new_client)
@@ -852,6 +825,45 @@ class Context:
 
 def _env_token() -> str:
     return os.getenv("NOTAMIFY_TOKEN", "").strip() or os.getenv("NOTAMIFY_WATCHER_TOKEN", "").strip()
+
+
+def _auth_choice(flag: str | None) -> str:
+    choice = (flag or os.getenv("NOTAMIFY_AUTH", "").strip() or "auto").lower().replace("_", "-")
+    if choice not in ("auto", "account", "api-key"):
+        raise CLIError("invalid_arguments", f"invalid auth {choice!r}; use auto, account or api-key", EXIT_USAGE)
+    return choice
+
+
+def select_auth(flag: str | None, operation: str, *, dry_run: bool = False) -> str:
+    """Which credential an operation uses: "account" or "api-key".
+
+    auto: NOTAMIFY_TOKEN wins, then a signed-in account (for operations it covers), then a
+    stored API key. A dry run with neither shows the API-key request.
+    """
+    choice = _auth_choice(flag)
+    signed_in = AccountStore().load() is not None
+    if choice == "auto":
+        if os.getenv("NOTAMIFY_TOKEN", "").strip():
+            return "api-key"
+        if signed_in and operation in ACCOUNT_TOOLS:
+            return "account"
+        if _api_key_available() or dry_run:
+            return "api-key"
+        if signed_in:
+            raise requires_api_key(operation)
+        raise CLIError(
+            "auth_missing",
+            "Not signed in and no API key is configured.",
+            EXIT_AUTH,
+            f"Run `{PROG} auth login` to sign in with your Notamify account, "
+            f"or `{PROG} auth login --api-key` / set NOTAMIFY_TOKEN to use an API key.",
+        )
+    if choice == "account":
+        if operation not in ACCOUNT_TOOLS:
+            raise requires_api_key(operation)
+        if not signed_in and not dry_run:
+            raise CLIError("not_signed_in", "Not signed in to a Notamify account.", EXIT_AUTH, f"Run `{PROG} auth login`.")
+    return choice
 
 
 def _api_key_available() -> bool:
@@ -969,8 +981,11 @@ class _Charges:
             self.pricing_mode = mode or self.pricing_mode
 
     def fields(self) -> dict[str, Any]:
-        rate = self.backend.cost(self.operation)
-        estimate = self.charged if self.charged is not None else (rate * self.calls if rate is not None else None)
+        if self.charged is not None:
+            estimate: int | None = self.charged
+        else:
+            rate = self.backend.cost(self.operation)
+            estimate = rate * self.calls if rate is not None else None
         data: dict[str, Any] = {"auth": self.backend.mode, "credits_estimate": estimate}
         if self.charged is not None:
             data["credits_charged"] = self.charged
@@ -1015,8 +1030,20 @@ def _list_notams(
     page = args.page
     total = 0
     complete = False
+    stopped: dict[str, Any] | None = None
     while charges.calls < max_pages:
-        result = backend.call(operation, {**query, "page": page, "per_page": args.per_page})
+        try:
+            result = backend.call(operation, {**query, "page": page, "per_page": args.per_page})
+        except CLIError as exc:
+            if exc.code != "rate_limited" or not charges.calls:
+                raise
+            wait = exc.details.get("retry_after")
+            if wait and wait <= 30:
+                time.sleep(wait)
+                continue
+            # Return the pages already fetched (and paid for) instead of discarding them.
+            stopped = {"reason": "rate_limited", "retry_after": wait}
+            break
         charges.add(result)
         total = int(result.get("total_count") or 0)
         batch = [n for n in result.get("notams") or [] if isinstance(n, dict)]
@@ -1041,6 +1068,8 @@ def _list_notams(
         "next_page": None if complete else page,
         **charges.fields(),
     }
+    if stopped:
+        body["stopped"] = stopped
     if transform is not None:
         body = {**transform(notams), **body}
     else:
@@ -1324,7 +1353,7 @@ def _flight_request(args: argparse.Namespace) -> dict[str, Any]:
             raise CLIError("invalid_body", f"cannot read JSON body: {exc}", EXIT_USAGE) from exc
         if not isinstance(body, dict):
             raise CLIError("invalid_body", "the JSON body must be an object", EXIT_USAGE)
-        return body
+        return _normalize_flight_body(body)
     locations = []
     if args.origin:
         locations.append(_location_spec(args.origin, "origin"))
@@ -1334,21 +1363,36 @@ def _flight_request(args: argparse.Namespace) -> dict[str, Any]:
     locations += [_location_spec(v, "fir") for v in args.fir or []]
     if not locations:
         raise CLIError("invalid_arguments", "give --origin and/or --destination (or --body)", EXIT_USAGE)
-    return _drop_none(
-        {
-            "locations": locations,
-            "aircraft_type": args.aircraft.upper() if args.aircraft else None,
-            "origin_runway": args.origin_runway,
-            "destination_runway": args.destination_runway,
-            "destination_procedure": args.destination_procedure,
-        }
+    return _normalize_flight_body(
+        _drop_none(
+            {
+                "locations": locations,
+                "aircraft_type": args.aircraft.upper() if args.aircraft else None,
+                "origin_runway": args.origin_runway,
+                "destination_runway": args.destination_runway,
+                "destination_procedure": args.destination_procedure,
+            }
+        )
     )
+
+
+def _normalize_flight_body(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a flight request locally, so both sign-ins send the same well-formed body."""
+    fields = {k: v for k, v in body.items() if k not in ("notam_id", "idempotency_key")}
+    try:
+        model = GenerateFlightBriefingRequest.model_validate(fields)
+    except ValidationError as exc:
+        raise CLIError("invalid_body", _validation_message(exc), EXIT_USAGE) from exc
+    return to_jsonable(model.model_dump(mode="json", exclude_none=True))
 
 
 def cmd_flight_create(ctx: Context) -> None:
     body = _flight_request(ctx.args)
-    if getattr(ctx.args, "idempotency_key", None):
-        body["idempotency_key"] = ctx.args.idempotency_key
+    key = getattr(ctx.args, "idempotency_key", None)
+    if key is not None:
+        if not 1 <= len(key) <= 128:
+            raise CLIError("invalid_arguments", "--idempotency-key must be 1 to 128 characters", EXIT_USAGE)
+        body["idempotency_key"] = key
     backend = ctx.backend("flight_create")
     if backend.mode != "account":
         body.pop("idempotency_key", None)
@@ -1422,9 +1466,17 @@ def _wait_for_briefing(ctx: Context, job_id: str, backend: Backend) -> None:
 def _poll_briefing(ctx: Context, job_id: str, backend: Backend) -> None:
     args = ctx.args
     deadline = time.monotonic() + max(args.wait_timeout, 0)
-    interval = max(args.interval, 0.5)
+    # Account calls share a per-minute limit with everything else the account runs.
+    interval = max(args.interval, 3.0 if backend.mode == "account" else 0.5)
     while True:
-        status = backend.call("flight_status", {"uuid": job_id})
+        try:
+            status = backend.call("flight_status", {"uuid": job_id})
+        except CLIError as exc:
+            wait = exc.details.get("retry_after")
+            if exc.code == "rate_limited" and wait and time.monotonic() + wait < deadline:
+                time.sleep(wait)
+                continue
+            raise
         state = str(status.get("status") or "")
         if state == "completed":
             ctx.out.emit(_envelope({"job": strip_extras(status), "auth": backend.mode}), _render_briefing_status)
@@ -1890,13 +1942,9 @@ def cmd_auth_status(ctx: Context) -> None:
         client_cfg = ConfigStore().load()
     except ValueError:
         client_cfg = SDKConfig()
-    if _env_token():
-        notams_auth = "api_key"
-    elif session is not None:
-        notams_auth = "account"
-    elif token:
-        notams_auth = "api_key"
-    else:
+    try:
+        notams_auth: str | None = select_auth(getattr(ctx.args, "auth", None), "active").replace("-", "_")
+    except CLIError:
         notams_auth = None
     account = None
     if session is not None:
@@ -1916,7 +1964,7 @@ def cmd_auth_status(ctx: Context) -> None:
         "config_path": str(ConfigStore().path),
         "api_base_url": client_cfg.api_base_url,
         "watcher_base_url": client_cfg.watcher_base_url,
-        "mcp_url": AccountAuth().mcp_url,
+        "mcp_url": os.getenv("NOTAMIFY_MCP_URL", "").strip() or DEFAULT_MCP_URL,
         "verified": False,
     }
 
@@ -1946,9 +1994,17 @@ def cmd_auth_status(ctx: Context) -> None:
 def cmd_auth_logout(ctx: Context) -> None:
     args = ctx.args
     both = not args.account and not args.api_key
-    signed_out = False
+    signed_out = revoked = False
     if both or args.account:
-        signed_out = AccountAuth().logout()
+        try:
+            result = AccountAuth().logout()
+        except AccountError:
+            # A bad NOTAMIFY_MCP_URL must not stop the local sign-out.
+            store = AccountStore()
+            with store.lock():
+                result = {"signed_out": store.load() is not None, "revoked": False}
+                store.clear_session()
+        signed_out, revoked = result["signed_out"], result["revoked"]
     removed_key = False
     store = ConfigStore()
     if (both or args.api_key) and store.path.exists():
@@ -1964,16 +2020,25 @@ def cmd_auth_logout(ctx: Context) -> None:
             )
     if os.getenv("NOTAMIFY_TOKEN", "").strip():
         ctx.out.note("NOTAMIFY_TOKEN is still set in this environment.")
-    data = {"account_signed_out": signed_out, "api_key_removed": removed_key, "config_path": str(store.path)}
+    data = {
+        "account_signed_out": signed_out,
+        "account_revoked": revoked,
+        "api_key_removed": removed_key,
+        "config_path": str(store.path),
+    }
 
     def render(d: Mapping[str, Any]) -> str:
         lines = []
         if both or args.account:
-            lines.append(
-                f"Signed out of your Notamify account (connection revoked; it is listed at {ACCOUNT_CONNECTIONS_URL})."
-                if signed_out
-                else "Not signed in to an account."
-            )
+            if not signed_out:
+                lines.append("Not signed in to an account.")
+            elif revoked:
+                lines.append("Signed out of your Notamify account and revoked the connection.")
+            else:
+                lines.append(
+                    "Signed out locally, but the server did not confirm the revocation. "
+                    f"Revoke the connection at {ACCOUNT_CONNECTIONS_URL}."
+                )
         if both or args.api_key:
             lines.append("Removed the stored API key." if removed_key else "No stored API key.")
         return "\n".join(lines)
@@ -2157,6 +2222,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CLIError as exc:
         out.error(exc)
         return exc.exit_code
+    except AccountError as exc:
+        err = error_from_account(exc)
+        out.error(err)
+        return err.exit_code
     except SilentExit as exc:
         return exc.code
     except KeyboardInterrupt:

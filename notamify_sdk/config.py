@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,17 +30,27 @@ class SDKConfig:
 def write_private_json(path: Path, payload: object) -> None:
     """Write JSON readable only by the current user (0600) from the moment it exists.
 
-    Writes a private temporary file and renames it over ``path``, so a failed write
-    never leaves a truncated file and an existing file with looser permissions is replaced.
+    Writes a new temporary file with an unpredictable name (created exclusively, never
+    through a symlink) and renames it over ``path``, so a failed write never leaves a
+    truncated file and an existing file with looser permissions is replaced.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(5):
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise OSError(f"cannot create a temporary file next to {path}")
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
-        os.chmod(tmp, 0o600)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:

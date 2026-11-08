@@ -10,8 +10,7 @@ Both backends take the same operation names and payloads and return plain dicts.
 
 from __future__ import annotations
 
-import hashlib
-import json
+import uuid
 from typing import Any, Callable, Mapping
 
 from pydantic import ValidationError
@@ -188,9 +187,9 @@ class AccountBackend(Backend):
         if operation == "flight_status":
             args = {"briefing_id": args["uuid"]}
         if operation == "flight_create" and not args.get("idempotency_key"):
-            # The same flight request gets the same key, so a retry returns the accepted job instead of a new charge.
-            canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
-            args["idempotency_key"] = "cli-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:40]
+            # A new key per run: a key whose first request failed stays reserved on the server,
+            # so reusing it would block that request. Pass --idempotency-key to retry deliberately.
+            args["idempotency_key"] = "cli-" + uuid.uuid4().hex
         return args
 
     def call(self, operation: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -269,8 +268,18 @@ def error_from_account(exc: AccountError) -> CLIError:
         return CLIError(code, exc.message, EXIT_NOT_FOUND)
     if code == "invalid_request":
         return CLIError("invalid_request", exc.message, EXIT_USAGE)
+    if code == "idempotency_conflict":
+        return CLIError(
+            code,
+            exc.message,
+            EXIT_USAGE,
+            "Check the earlier request with `notamify briefing flight status UUID`; to submit again, "
+            "drop --idempotency-key or use a new one.",
+        )
+    if code == "insecure_server":
+        return CLIError(code, exc.message, EXIT_AUTH, "Check NOTAMIFY_MCP_URL; it should be https://mcp.notamify.com/mcp.")
     if code in ("rate_limited", "unavailable", "login_timeout"):
-        details = {"retry_after": exc.retry_after} if exc.retry_after else {}
+        details: dict[str, Any] = {"retry_after": exc.retry_after} if exc.retry_after else {}
         return CLIError(code, exc.message, EXIT_TEMPORARY, "Wait and retry.", details=details)
     return CLIError(code, exc.message, EXIT_ERROR)
 

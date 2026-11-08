@@ -134,11 +134,85 @@ class TokenTests(AccountTestCase):
 
     def test_logout_revokes_and_keeps_the_registration(self):
         self.login()
-        self.assertTrue(self.auth().logout())
+        self.assertEqual(self.auth().logout(), {"signed_out": True, "revoked": True})
         self.assertTrue(self.server.revoked_grants)
         self.assertIsNone(AccountStore(self.store_path).load())
         self.assertIsNotNone(AccountStore(self.store_path).client(self.server.base))
-        self.assertFalse(self.auth().logout())
+        self.assertEqual(self.auth().logout(), {"signed_out": False, "revoked": False})
+
+
+class ServerBindingTests(AccountTestCase):
+    def test_tokens_are_never_sent_to_another_server(self):
+        self.server.expires_in = 0  # force a refresh attempt too
+        self.login()
+        other = FakeAccountServer().start()
+        try:
+            other_auth = AccountAuth(other.mcp_url, AccountStore(self.store_path))
+            with self.assertRaises(AccountError) as ctx:
+                McpClient(other_auth).call_tool("get_notam", {"notam_id": "x"})
+            self.assertEqual(ctx.exception.code, "not_signed_in")
+            self.assertEqual([r for r in other.api.requests if r.path in ("/mcp", "/oauth/token")], [])
+            self.assertIsNotNone(AccountStore(self.store_path).load())  # the real session is untouched
+        finally:
+            other.stop()
+
+    def test_insecure_server_url_is_refused(self):
+        with self.assertRaises(AccountError) as ctx:
+            AccountAuth("http://example.com/mcp", AccountStore(self.store_path))
+        self.assertEqual(ctx.exception.code, "insecure_server")
+
+    def test_metadata_with_another_issuer_is_refused(self):
+        self.server.metadata_issuer = "https://evil.example"
+        with self.assertRaises(AccountError) as ctx:
+            self.login()
+        self.assertEqual(ctx.exception.code, "insecure_server")
+
+    def test_missing_iss_is_refused_when_advertised(self):
+        self.server.omit_iss = True
+        with self.assertRaises(AccountError) as ctx:
+            self.login()
+        self.assertEqual(ctx.exception.code, "login_failed")
+
+    def test_callback_with_another_state_does_not_end_the_login(self):
+        from urllib import request as urlrequest
+
+        def hijack_then_approve(url):
+            port = parse_port(url)
+            try:
+                urlrequest.urlopen(f"http://127.0.0.1:{port}/callback?code=evil&state=wrong", timeout=5)
+            except Exception:
+                pass
+            approve_in_background(url)
+
+        session = self.auth().login(open_browser=False, timeout=10, on_url=hijack_then_approve)
+        self.assertTrue(session.access_token.startswith("at-"))
+
+    def test_temporary_refresh_failure_keeps_the_session(self):
+        self.server.expires_in = 0
+        self.login()
+        self.server.token_status = (429, {"error": "rate_limited"})
+        with self.assertRaises(AccountError) as ctx:
+            self.auth().access_token()
+        self.assertEqual(ctx.exception.code, "unavailable")
+        self.assertIsNotNone(AccountStore(self.store_path).load())
+
+    def test_redirects_are_not_followed(self):
+        self.login()
+        other = FakeAccountServer().start()
+        try:
+            self.server.api.route("POST", "/mcp", lambda req: (302, None, {"Location": f"{other.base}/mcp"}))
+            with self.assertRaises(AccountError):
+                McpClient(self.auth()).call_tool("get_notam", {"notam_id": "x"})
+            self.assertEqual(other.api.requests, [])
+        finally:
+            other.stop()
+
+
+def parse_port(url):
+    from urllib.parse import parse_qs, urlsplit
+
+    redirect = parse_qs(urlsplit(url).query)["redirect_uri"][0]
+    return urlsplit(redirect).port
 
 
 class McpTests(AccountTestCase):
@@ -182,7 +256,8 @@ class McpTests(AccountTestCase):
             "Notamify rejected this query. Check its parameters before trying again.": ("invalid_request", None),
             "Notamify service is temporarily unavailable.": ("unavailable", None),
             "Reconnect this app and approve briefing generation permission.": ("insufficient_scope", None),
-            "This request key was already used with different flight details.": ("invalid_request", None),
+            "This request key was already used with different flight details.": ("idempotency_conflict", None),
+            "This briefing request is in progress or its outcome is uncertain.": ("idempotency_conflict", None),
         }
         for text, (code, retry) in cases.items():
             with self.subTest(text=text):

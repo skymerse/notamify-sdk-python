@@ -1,9 +1,9 @@
-"""A local fake of the hosted Notamify MCP server's OAuth and MCP endpoints.
+"""A local fake of an OAuth 2.1 authorization server and MCP endpoint for tests.
 
-It follows the production rules that matter to clients: PKCE S256, dynamic client
-registration with loopback redirects on any port, iss on the redirect, rotating
-refresh tokens that can be redeemed once (a second redemption revokes the grant),
-stateless JSON-RPC over POST /mcp, structuredContent results and text-only errors.
+It implements what a careful client must handle: PKCE S256, dynamic client
+registration with loopback redirects on any port, iss on the redirect, single-use
+refresh tokens with replay detection (RFC 9700), stateless JSON-RPC over POST /mcp,
+structuredContent results and text-only tool errors.
 """
 
 from __future__ import annotations
@@ -35,6 +35,9 @@ class FakeAccountServer:
         self.tools: dict[str, ToolHandler] = {}
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self.deny = False
+        self.omit_iss = False
+        self.token_status: tuple[int, Any] | None = None
+        self.metadata_issuer: str | None = None
         self.grant_scope: str | None = None
         self.expires_in = 900
         self.billing = {
@@ -78,12 +81,13 @@ class FakeAccountServer:
             lambda req: (
                 200,
                 {
-                    "issuer": self.base,
+                    "issuer": self.metadata_issuer or self.base,
                     "authorization_endpoint": f"{self.base}/authorize",
                     "token_endpoint": f"{self.base}/oauth/token",
                     "registration_endpoint": f"{self.base}/oauth/register",
                     "revocation_endpoint": f"{self.base}/oauth/token",
                     "code_challenge_methods_supported": ["S256"],
+                    "authorization_response_iss_parameter_supported": True,
                     "scopes_supported": ["notams:read", "briefings:write"],
                 },
             ),
@@ -129,6 +133,8 @@ class FakeAccountServer:
                     "resource": q.get("resource"),
                 }
             params = {"code": code, "state": q.get("state", ""), "iss": self.base}
+        if self.omit_iss:
+            params.pop("iss", None)
         return 302, None, {"Location": f"{q['redirect_uri']}?{urlencode(params)}"}
 
     def _issue(self, client_id: str, scope: str, grant: str) -> dict[str, Any]:
@@ -140,6 +146,8 @@ class FakeAccountServer:
 
     def _token(self, req: Request) -> tuple[int, Any]:
         body = req.body or {}
+        if self.token_status is not None and body.get("grant_type") == "refresh_token":
+            return self.token_status
         with self.lock:
             if "token" in body and "grant_type" not in body:  # RFC 7009 revocation
                 record = self.refresh.pop(body["token"], None)
@@ -160,9 +168,9 @@ class FakeAccountServer:
             if body.get("grant_type") == "refresh_token":
                 token = body.get("refresh_token", "")
                 if token in self.redeemed:
-                    # Replay: revoke the whole grant, as production does.
+                    # Replay detection: revoke the grant (RFC 9700 section 4.14.2).
                     self.revoked_grants.update(r["grant"] for r in self.refresh.values())
-                    return 400, {"error": "invalid_grant", "error_description": "Credential already redeemed. Reconnect the app."}
+                    return 400, {"error": "invalid_grant", "error_description": "refresh token reused"}
                 record = self.refresh.pop(token, None)
                 if record is None or record["grant"] in self.revoked_grants:
                     return 400, {"error": "invalid_grant"}

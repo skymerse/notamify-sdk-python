@@ -215,6 +215,12 @@ class ReviewRegressionTests(CLITestCase):
         code, _, err = self.run_json("notams", "active", "EPWA")
         self.assertEqual((code, err["error"]["code"]), (7, "invalid_response"))
 
+    def test_dry_run_without_credentials(self):
+        with mock.patch.dict(os.environ, {"NOTAMIFY_TOKEN": ""}):
+            code, data, _ = self.run_json("notams", "active", "EPWA", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertFalse(data["authenticated"])
+
     def test_raw_has_no_interpretation_filters(self):
         code, _, err = self.run_json("notams", "raw", "EPWA", "--category", "AERODROME")
         self.assertEqual(code, 2)

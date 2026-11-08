@@ -53,7 +53,7 @@ Each list result has `total_count`, `complete` and `next_page`. When `complete` 
 
 A command that may spend more than one credit (`--all`, briefings, prioritize), or that changes Watcher state (create, update or delete a listener, rotate the secret), exits 4 without `--yes`. The JSON error on stderr has `credits_estimate` and `confirm_command`. Tell the user what it will do and cost, and run `confirm_command` only after they agree. `--dry-run` shows the request and estimated cost without sending anything.
 
-Flight briefings are asynchronous. `--wait` polls until done. Otherwise poll with `notamify briefing flight wait UUID`; polling is free. A failed briefing (exit 1, code `briefing_failed`) is final: report it and stop polling. A briefing is only visible to the sign-in method that created it (account or API key). With account sign-in, rerunning the same `flight create` returns the already accepted job instead of charging again.
+Flight briefings are asynchronous. `--wait` polls until done. Otherwise poll with `notamify briefing flight wait UUID`; polling is free. A failed briefing (exit 1, code `briefing_failed`) is final: report it and stop polling. A briefing is only visible to the sign-in method that created it (account or API key). If `--wait` fails after the job was accepted (stderr has `{"event": "briefing_accepted", "uuid": ...}` and the error has `uuid`), do not create it again: poll that UUID. Results are complete only when `complete` is true; category and affected-element filters apply after paging, so a short page does not mean the end.
 
 ## Exit codes
 
