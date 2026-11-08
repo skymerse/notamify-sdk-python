@@ -1931,7 +1931,10 @@ def cmd_auth_status(ctx: Context) -> None:
         else:
             lines.append(f"API key: none. Run `{PROG} auth login --api-key` or set NOTAMIFY_TOKEN.")
         names = {"account": "your account", "api_key": "the API key", None: "nothing (sign in first)"}
-        lines.append(f"NOTAMs and briefings use {names[d['notams_and_briefings']]}; Watcher uses {names[d['watcher']]}.")
+        lines.append(
+            f"NOTAMs and briefings use {names[d['notams_and_briefings']]}; "
+            f"Watcher and `notams raw` use {names[d['watcher']]}."
+        )
         lines.append("Not verified against the server; data requests spend credits.")
         return "\n".join(lines)
 

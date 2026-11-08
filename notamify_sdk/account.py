@@ -159,14 +159,17 @@ class AccountStore:
                 import fcntl
 
                 fcntl.flock(fd, fcntl.LOCK_EX)
-            except ImportError:  # Windows
+            except ImportError:  # Windows (not covered by CI)
                 import msvcrt
 
+                deadline = time.monotonic() + 30
                 while True:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
                         break
                     except OSError:
+                        if time.monotonic() > deadline:
+                            raise AccountError("unavailable", f"timed out waiting for {lock_path}")
                         time.sleep(0.1)
             yield
         finally:
