@@ -66,17 +66,26 @@ class FakeAPI:
                 url = urlsplit(self.path)
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 raw = self.rfile.read(length) if length else b""
-                body = json.loads(raw) if raw else None
+                if "application/x-www-form-urlencoded" in self.headers.get("Content-Type", ""):
+                    body = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+                else:
+                    body = json.loads(raw) if raw else None
                 req = Request(method, url.path, parse_qs(url.query), body, dict(self.headers))
                 api.requests.append(req)
                 route = api.routes.get((method, url.path))
+                headers: dict[str, str] = {}
                 if route is None:
                     status, payload = 404, {"error": "no route"}
                 else:
-                    status, payload = route(req)
+                    result = route(req)
+                    status, payload = result[0], result[1]
+                    if len(result) > 2:
+                        headers = dict(result[2])
                 data = b"" if payload is None else (payload.encode() if isinstance(payload, str) else json.dumps(payload).encode())
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                headers.setdefault("Content-Type", "application/json")
+                for name, value in headers.items():
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)

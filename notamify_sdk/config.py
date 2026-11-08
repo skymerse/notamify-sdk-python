@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,39 @@ class SDKConfig:
     @base_url.setter
     def base_url(self, value: str) -> None:
         self.watcher_base_url = value
+
+
+def write_private_json(path: Path, payload: object) -> None:
+    """Write JSON readable only by the current user (0600) from the moment it exists.
+
+    Writes a new temporary file with an unpredictable name (created exclusively, never
+    through a symlink) and renames it over ``path``, so a failed write never leaves a
+    truncated file and an existing file with looser permissions is replaced.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(5):
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise OSError(f"cannot create a temporary file next to {path}")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def apply_environment(cfg: SDKConfig) -> SDKConfig:
@@ -80,19 +114,4 @@ class ConfigStore:
             "base_url": cfg.watcher_base_url.strip(),
             "token": cfg.token.strip(),
         }
-        data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-        # Write a private temporary file and rename it over the config, so the key is never
-        # readable by others and a failed write never leaves a truncated config behind.
-        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        write_private_json(self.path, payload)

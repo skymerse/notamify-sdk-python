@@ -45,11 +45,18 @@ class CLITestCase(unittest.TestCase):
                 "NOTAMIFY_WATCHER_BASE_URL": self.api.url,
                 "NOTAMIFY_CONFIG_FILE": str(self.config),
                 "NOTAMIFY_OUTPUT": "",
+                "NOTAMIFY_AUTH": "",
+                "NOTAMIFY_ACCOUNT_FILE": str(Path(self.tmp.name) / "account.json"),
+                # Never reach the real sign-in server or a real browser from tests.
+                "NOTAMIFY_MCP_URL": "http://127.0.0.1:9/mcp",
             },
         )
         self.env.start()
+        self.browser = mock.patch("webbrowser.open", side_effect=AssertionError("tests must not open a browser"))
+        self.browser.start()
 
     def tearDown(self):
+        self.browser.stop()
         self.env.stop()
         self.api.stop()
         self.tmp.cleanup()
@@ -62,7 +69,8 @@ class CLITestCase(unittest.TestCase):
 
     def run_json(self, *argv: str, stdin: str = ""):
         code, out, err = self.run_cli(*argv, stdin=stdin)
-        return code, (json.loads(out) if out.strip() else None), (json.loads(err) if err.strip() else None)
+        err_lines = [line for line in err.splitlines() if line.strip()]
+        return code, (json.loads(out) if out.strip() else None), (json.loads(err_lines[-1]) if err_lines else None)
 
 
 class NotamCommandTests(CLITestCase):
@@ -206,6 +214,12 @@ class ReviewRegressionTests(CLITestCase):
         self.api.route("GET", "/notams", (200, "<html>proxy</html>"))
         code, _, err = self.run_json("notams", "active", "EPWA")
         self.assertEqual((code, err["error"]["code"]), (7, "invalid_response"))
+
+    def test_dry_run_without_credentials(self):
+        with mock.patch.dict(os.environ, {"NOTAMIFY_TOKEN": ""}):
+            code, data, _ = self.run_json("notams", "active", "EPWA", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertFalse(data["authenticated"])
 
     def test_raw_has_no_interpretation_filters(self):
         code, _, err = self.run_json("notams", "raw", "EPWA", "--category", "AERODROME")
@@ -363,15 +377,16 @@ class LocalCommandTests(CLITestCase):
             self.assertNotIn("abcdefghijklmnop", json.dumps(data))
 
             code, data, _ = self.run_json("auth", "status")
-            self.assertEqual((code, data["source"]), (0, "config"))
+            self.assertEqual((code, data["api_key"]["source"], data["notams_and_briefings"]), (0, "config", "api_key"))
 
             code, data, _ = self.run_json("auth", "logout")
-            self.assertTrue(data["removed"])
+            self.assertTrue(data["api_key_removed"])
+            self.assertFalse(data["account_signed_out"])
             code, _, _ = self.run_json("auth", "status")
             self.assertEqual(code, 3)
 
-    def test_login_without_terminal_or_stdin_flag(self):
-        code, _, err = self.run_json("auth", "login")
+    def test_api_key_login_without_terminal_or_stdin_flag(self):
+        code, _, err = self.run_json("auth", "login", "--api-key")
         self.assertEqual(code, 2)
         self.assertIn("--token-stdin", err["error"]["remediation"])
 
