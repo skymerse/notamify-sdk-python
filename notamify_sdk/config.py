@@ -26,6 +26,29 @@ class SDKConfig:
         self.watcher_base_url = value
 
 
+def write_private_json(path: Path, payload: object) -> None:
+    """Write JSON readable only by the current user (0600) from the moment it exists.
+
+    Writes a private temporary file and renames it over ``path``, so a failed write
+    never leaves a truncated file and an existing file with looser permissions is replaced.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def apply_environment(cfg: SDKConfig) -> SDKConfig:
     """Override ``cfg`` with NOTAMIFY_* environment variables, which take precedence over the config file."""
     env_api_base = os.getenv("NOTAMIFY_API_BASE_URL", "").strip()
@@ -80,19 +103,4 @@ class ConfigStore:
             "base_url": cfg.watcher_base_url.strip(),
             "token": cfg.token.strip(),
         }
-        data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-        # Write a private temporary file and rename it over the config, so the key is never
-        # readable by others and a failed write never leaves a truncated config behind.
-        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        write_private_json(self.path, payload)

@@ -25,7 +25,8 @@ notamify --version
 `uv tool install` and `pipx install` put the `notamify` command in `~/.local/bin`. If your shell then reports `command not found: notamify`, add that directory to your `PATH` with `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal. Without installing anything, `uvx notamify ...` runs the latest release.
 
 ```bash
-notamify auth login                                    # API key from https://notamify.com/api-manager
+notamify auth login                                    # sign in with your Notamify account (browser)
+notamify auth login --api-key                          # or use an API key from https://notamify.com/api-manager
 notamify notams active EPWA EGLL --start now --hours 24
 notamify affected EPWA --affected CLOSED:RUNWAY
 notamify briefing flight create --origin EPWA@now/+2h --destination EGLL@+2h/+3h --aircraft B738 --wait

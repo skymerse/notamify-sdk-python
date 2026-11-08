@@ -25,14 +25,18 @@ To update: `uv tool upgrade notamify` (or `pipx upgrade notamify`).
 
 ## Sign in
 
-Create an API key at [notamify.com/api-manager](https://notamify.com/api-manager) (Notamify Pro or an API plan), then:
+Two ways, and you can use both:
 
 ```bash
-notamify auth login           # prompts for the key; saved to ~/.config/notamify/config.json (mode 0600)
-notamify auth status
+notamify auth login              # sign in with your Notamify account in the browser
+notamify auth login --api-key    # or save an API key (~/.config/notamify/config.json, mode 0600)
+notamify auth status             # which one each command uses
 ```
 
-`NOTAMIFY_TOKEN` takes precedence over the saved key, which suits CI, containers and agents.
+- **Notamify account.** Like the Notamify plugins for Claude, Codex and ChatGPT: the browser opens notamify.com, you approve the CLI, and requests are billed to your account at the connected-app rate. No key to copy. Needs Notamify Pro. Covers NOTAMs and briefings. Manage or revoke the connection at [notamify.com/account](https://notamify.com/account#connections). On a remote machine, use `notamify auth login --no-browser --port 8765` and forward the port: `ssh -L 8765:127.0.0.1:8765 host`.
+- **API key.** Create one at [notamify.com/api-manager](https://notamify.com/api-manager). Needed for Watcher commands and `notams raw`. `NOTAMIFY_TOKEN` takes precedence over everything else, which suits CI, containers and agents.
+
+`--auth account` or `--auth api-key` (or `NOTAMIFY_AUTH`) picks one explicitly.
 
 ## Use
 

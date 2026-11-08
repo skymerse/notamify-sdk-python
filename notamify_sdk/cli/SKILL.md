@@ -3,7 +3,7 @@ name: notamify
 description: Retrieve NOTAMs (Notices to Airmen), affected runways/taxiways/navaids/airspace, airport and flight briefings, and manage NOTAM Watcher webhooks with the `notamify` CLI. Use when the user asks about NOTAMs, airport or airspace restrictions, closures, a flight briefing, or Notamify Watcher listeners.
 homepage: https://github.com/skymerse/notamify-sdk-python
 user-invocable: true
-metadata: {"openclaw":{"emoji":"✈️","requires":{"env":["NOTAMIFY_TOKEN"],"bins":["notamify"]},"primaryEnv":"NOTAMIFY_TOKEN"}}
+metadata: {"openclaw":{"emoji":"✈️","requires":{"bins":["notamify"]},"primaryEnv":"NOTAMIFY_TOKEN"}}
 ---
 
 # Notamify CLI
@@ -13,13 +13,17 @@ You retrieve and explain NOTAMs for pilots, dispatchers and aviation teams by ru
 ## Before the first command
 
 1. `notamify --version`. If the command is not found, install it: `uv tool install notamify` (or `pipx install notamify`). Both put `notamify` in `~/.local/bin`; if that directory is not on PATH, run `uv tool update-shell` (or `pipx ensurepath`) and tell the user to open a new terminal. In the meantime, call it as `~/.local/bin/notamify` or `uvx notamify`.
-2. `notamify auth status` exits 3 when no API key is set. Ask the user to run `notamify auth login` themselves, or to set `NOTAMIFY_TOKEN`. Never ask for the key in chat, and never put it on a command line. Keys come from https://notamify.com/api-manager (Notamify Pro or an API plan).
+2. `notamify auth status` exits 3 when the user is neither signed in nor has an API key. There are two ways to authenticate:
+   - **Notamify account (recommended for people):** `notamify auth login` opens the browser to approve the CLI, like the Notamify plugins. In JSON mode it first writes `{"event": "sign_in", "url": ...}` to stderr; show that URL to the user and wait (up to 5 minutes) while they approve. It needs Notamify Pro and is billed at the connected-app rate.
+   - **API key (CI, servers, Watcher):** the user sets `NOTAMIFY_TOKEN`, or runs `notamify auth login --api-key` themselves. Never ask for the key in chat, and never put it on a command line. Keys come from https://notamify.com/api-manager.
+   Account sign-in covers NOTAMs and briefings. Watcher commands and `notams raw` need an API key (exit 3, code `api_key_required`).
 3. Do not run a data command just to test the connection: data commands spend API credits.
 
 ## How to call it
 
 - Output is JSON when stdout is not a terminal, which is how you run it. `--json` forces it.
 - Use `--fields` on list commands to keep output small, e.g. `--fields id,notam_number,location,starts_at,ends_at,interpretation.excerpt`.
+- With account sign-in, list results carry short interpretations (category, excerpt, affected elements, schedules); use `notams get ID` for the full interpretation. Every result says which `auth` it used, and `credits_charged` when the server reports the charge.
 - `notamify commands --json` lists every command, option, credit cost and exit code. `notamify COMMAND --help` has examples.
 - Times are UTC: ISO 8601 (`2026-11-09T10:00:00Z`), `YYYY-MM-DD`, `now`, or offsets like `+6h`, `-30m`, `+2d`. Resolve "tomorrow" and similar phrases from today's date, and state the window you used.
 - Locations are ICAO codes (EPWA, KJFK, EGLL), at most 5 per request. Convert airport names to ICAO codes yourself.
@@ -49,7 +53,7 @@ Each list result has `total_count`, `complete` and `next_page`. When `complete` 
 
 A command that may spend more than one credit (`--all`, briefings, prioritize), or that changes Watcher state (create, update or delete a listener, rotate the secret), exits 4 without `--yes`. The JSON error on stderr has `credits_estimate` and `confirm_command`. Tell the user what it will do and cost, and run `confirm_command` only after they agree. `--dry-run` shows the request and estimated cost without sending anything.
 
-Flight briefings are asynchronous. `--wait` polls until done. Otherwise poll with `notamify briefing flight wait UUID`; polling is free. A failed briefing (exit 1, code `briefing_failed`) is final: report it and stop polling.
+Flight briefings are asynchronous. `--wait` polls until done. Otherwise poll with `notamify briefing flight wait UUID`; polling is free. A failed briefing (exit 1, code `briefing_failed`) is final: report it and stop polling. A briefing is only visible to the sign-in method that created it (account or API key). With account sign-in, rerunning the same `flight create` returns the already accepted job instead of charging again.
 
 ## Exit codes
 
@@ -58,7 +62,7 @@ Flight briefings are asynchronous. `--wait` polls until done. Otherwise poll wit
 | 0 | Success | |
 | 1 | Error that a retry will not fix | Report it |
 | 2 | Invalid command, option or request | Fix the arguments; see `--help` |
-| 3 | No API key, or the key was rejected | Ask the user to run `notamify auth login` |
+| 3 | Not signed in, session expired, no API key, or the key was rejected | Ask the user to run `notamify auth login` (or `--api-key` for Watcher) |
 | 4 | Needs `--yes` | Confirm with the user, then run `confirm_command` |
 | 5 | Insufficient credits, or endpoint not allowed | Tell the user; credits are at https://notamify.com/api-manager. Do not promote purchases |
 | 6 | Not found | Check the ID or location |

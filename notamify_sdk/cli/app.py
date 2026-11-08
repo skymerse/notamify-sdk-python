@@ -18,6 +18,7 @@ import shlex
 import sys
 import time
 import uuid as uuidlib
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -25,10 +26,21 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from pydantic import ValidationError
 
+from ..account import SCOPES, AccountAuth, AccountError, AccountStore, McpClient
 from ..client import SDK_VERSION, APIError, NotamifyClient
 from ..cloudflared import CloudflaredError, CloudflaredManager
 from ..config import ConfigStore, SDKConfig
 from ..receiver import ReceivedEvent, ReceiverConfig, WebhookReceiver
+from .backends import (
+    ACCOUNT_TOOLS,
+    AccountBackend,
+    ApiKeyBackend,
+    Backend,
+    credits_charged,
+    error_from_account,
+    requires_api_key,
+    strip_extras,
+)
 from .output import (
     API_KEYS_URL,
     DISCLAIMER,
@@ -143,6 +155,12 @@ def _action_options() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         metavar="SECONDS",
         help="HTTP timeout for reads (default 10)",
+    )
+    group.add_argument(
+        "--auth",
+        choices=["auto", "account", "api-key"],
+        default=argparse.SUPPRESS,
+        help="sign-in to use; auto prefers NOTAMIFY_TOKEN, then your account, then a stored key (also NOTAMIFY_AUTH)",
     )
     return parent
 
@@ -325,26 +343,50 @@ def build_parser() -> Parser:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True, parser_class=Parser)
 
     # auth
-    auth = _add_group(sub, "auth", "Store, inspect or remove the API key")
+    auth = _add_group(sub, "auth", "Sign in with your Notamify account or an API key")
     p = _add_command(
         auth,
         "login",
         cmd_auth_login,
         CommandMeta(
-            "Save an API key to the config file",
+            "Sign in with your Notamify account in the browser (default) or save an API key",
             network=False,
-            examples=[f"{PROG} auth login", f'printf %s "$KEY" | {PROG} auth login --token-stdin'],
+            examples=[
+                f"{PROG} auth login",
+                f"{PROG} auth login --no-browser --port 8765   # then: ssh -L 8765:127.0.0.1:8765 this-host",
+                f"{PROG} auth login --api-key",
+                f'printf %s "$KEY" | {PROG} auth login --token-stdin',
+            ],
         ),
-        description=f"Save an API key to the config file (mode 0600). Create a key at {API_KEYS_URL}.",
+        description=(
+            "Sign in with your Notamify account, like the Notamify plugins and connectors: your browser opens\n"
+            "notamify.com to approve the CLI, and requests are billed to your account at the connected-app rate.\n"
+            "No API key needed. Account sign-in covers NOTAMs and briefings; Watcher commands and `notams raw`\n"
+            f"need an API key (--api-key). Create keys at {API_KEYS_URL}."
+        ),
     )
-    p.add_argument("--token-stdin", action="store_true", help="read the key from stdin instead of prompting")
+    p.add_argument("--api-key", action="store_true", help="save an API key instead (prompts for it)")
+    p.add_argument("--token-stdin", action="store_true", help="save an API key read from stdin")
+    p.add_argument("--no-browser", action="store_true", help="print the sign-in URL instead of opening a browser")
+    p.add_argument("--port", type=int, default=0, help="local port for the sign-in callback (default: any free port)")
+    p.add_argument(
+        "--login-timeout", type=float, default=300, metavar="SECONDS", help="how long to wait for the browser (default 300)"
+    )
     _add_command(
         auth,
         "status",
         cmd_auth_status,
-        CommandMeta("Show where the API key comes from; exits 3 when none is set", network=False),
+        CommandMeta("Show the account session and API key in use; exits 3 when neither is set", network=False),
     )
-    _add_command(auth, "logout", cmd_auth_logout, CommandMeta("Remove the stored API key", network=False))
+    p = _add_command(
+        auth,
+        "logout",
+        cmd_auth_logout,
+        CommandMeta("Sign out of the account and remove the stored API key", network=False),
+    )
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--account", action="store_true", help="only sign out of the account")
+    which.add_argument("--api-key", action="store_true", help="only remove the stored API key")
 
     # notams
     notams = _add_group(sub, "notams", "Search and read NOTAMs")
@@ -496,6 +538,12 @@ def build_parser() -> Parser:
     )
     _add_flight(p)
     p.add_argument("--wait", action="store_true", help="poll until the job completes or fails")
+    p.add_argument(
+        "--idempotency-key",
+        metavar="KEY",
+        help="account sign-in only: retries with the same key return the accepted job without a new charge "
+        "(default: derived from the request)",
+    )
     p.add_argument("--wait-timeout", type=float, default=300, metavar="SECONDS", help="give up waiting after this long (default 300)")
     p.add_argument("--interval", type=float, default=3, metavar="SECONDS", help="poll interval (default 3)")
 
@@ -664,6 +712,7 @@ class Context:
         self.out = out
         self.argv = list(argv)
         self._client: NotamifyClient | None = None
+        self._backends: dict[str, Backend] = {}
 
     @property
     def yes(self) -> bool:
@@ -673,15 +722,71 @@ class Context:
     def dry_run(self) -> bool:
         return bool(getattr(self.args, "dry_run", False))
 
+    def _new_client(self) -> NotamifyClient:
+        timeout = getattr(self.args, "timeout", None)
+        kwargs: dict[str, Any] = {"user_agent": f"notamify-cli/{SDK_VERSION}"}
+        if timeout:
+            kwargs["timeout"] = timeout
+        return NotamifyClient(**kwargs)
+
     @property
     def client(self) -> NotamifyClient:
+        """The API-key client, used by Watcher commands. Account sign-in does not cover Watcher."""
         if self._client is None:
-            timeout = getattr(self.args, "timeout", None)
-            kwargs: dict[str, Any] = {"user_agent": f"notamify-cli/{SDK_VERSION}"}
-            if timeout:
-                kwargs["timeout"] = timeout
-            self._client = NotamifyClient(**kwargs)
+            if not _api_key_available() and AccountStore().load() is not None and not self.dry_run:
+                raise requires_api_key("watcher")
+            self._client = self._new_client()
         return self._client
+
+    def backend(self, operation: str) -> Backend:
+        """Pick API key or account for a NOTAM or briefing operation.
+
+        auto: NOTAMIFY_TOKEN wins, then a signed-in account, then a stored API key.
+        """
+        choice = getattr(self.args, "auth", None) or os.getenv("NOTAMIFY_AUTH", "").strip().lower() or "auto"
+        if choice not in ("auto", "account", "api-key"):
+            raise CLIError("invalid_arguments", f"invalid auth {choice!r}; use auto, account or api-key", EXIT_USAGE)
+        signed_in = AccountStore().load() is not None
+        if choice == "auto":
+            if _env_token():
+                choice = "api-key"
+            elif signed_in and operation in ACCOUNT_TOOLS:
+                choice = "account"
+            elif _api_key_available():
+                choice = "api-key"
+            elif signed_in:
+                raise requires_api_key(operation)
+            else:
+                raise CLIError(
+                    "auth_missing",
+                    "Not signed in and no API key is configured.",
+                    EXIT_AUTH,
+                    f"Run `{PROG} auth login` to sign in with your Notamify account, "
+                    f"or `{PROG} auth login --api-key` / set NOTAMIFY_TOKEN to use an API key.",
+                )
+        if choice == "account":
+            if operation not in ACCOUNT_TOOLS:
+                raise requires_api_key(operation)
+            if not signed_in and not self.dry_run:
+                raise CLIError("not_signed_in", "Not signed in to a Notamify account.", EXIT_AUTH, f"Run `{PROG} auth login`.")
+        key = "account" if choice == "account" else "api_key"
+        if key not in self._backends:
+            self._backends[key] = AccountBackend() if key == "account" else ApiKeyBackend(self._new_client)
+        return self._backends[key]
+
+    def cost_text(self, backend: Backend, operation: str, calls: int = 1, *, up_to: bool = False) -> str:
+        rate = backend.cost(operation)
+        if rate is None:
+            return "billed at your account's connected-app rate" if backend.mode == "account" else "unknown"
+        if rate == 0:
+            return "free"
+        total = rate * calls
+        text = f"{'up to ' if up_to else ''}{total} credit{'s' if total != 1 else ''}"
+        if calls > 1:
+            text += f" ({rate} per page)"
+        if backend.mode == "account":
+            text += ", account rate"
+        return text
 
     def confirm_command(self) -> str:
         return shlex.join([PROG, *self.argv, "--yes"])
@@ -706,8 +811,28 @@ class Context:
             details={"action": action, "credits_estimate": credits, "confirm_command": self.confirm_command()},
         )
 
-    def plan(self, method: str, base: str, path: str, *, query: Mapping[str, Any] | None = None, body: Any = None, credits: str | None = None) -> bool:
+    def plan_operation(self, backend: Backend, operation: str, payload: Mapping[str, Any], credits: str) -> bool:
         """Print the request instead of sending it under --dry-run. Returns True when it did."""
+        if not self.dry_run:
+            return False
+        described = backend.describe(operation, payload)
+        data = {"dry_run": True, **described, "credits_estimate": credits}
+
+        def render(d: Mapping[str, Any]) -> str:
+            req = d["request"]
+            head = f"{req['method']} {req['url']}" if "url" in req else f"MCP tool {req['tool']} on {req['server']}"
+            body = req.get("body") or req.get("arguments")
+            return (
+                head
+                + (f"\n{json.dumps(body, indent=2)}" if body else "")
+                + f"\nauth: {backend.label}; credits: {credits} (dry run, nothing sent)"
+            )
+
+        self.out.emit(data, render)
+        return True
+
+    def plan(self, method: str, base: str, path: str, *, query: Mapping[str, Any] | None = None, body: Any = None, credits: str | None = None) -> bool:
+        """Dry run for Watcher requests (API key)."""
         if not self.dry_run:
             return False
         client = self.client
@@ -717,12 +842,28 @@ class Context:
         if body is not None:
             request["body"] = to_jsonable(body)
         self.out.emit(
-            {"dry_run": True, "request": request, "credits_estimate": credits, "authenticated": bool(client.token)},
+            {"dry_run": True, "auth": "api_key", "request": request, "credits_estimate": credits, "authenticated": bool(client.token)},
             lambda d: f"{d['request']['method']} {d['request']['url']}"
             + (f"\n{json.dumps(d['request']['body'], indent=2)}" if "body" in d["request"] else "")
             + f"\ncredits: {credits or 'free'} (dry run, nothing sent)",
         )
         return True
+
+
+def _env_token() -> str:
+    return os.getenv("NOTAMIFY_TOKEN", "").strip() or os.getenv("NOTAMIFY_WATCHER_TOKEN", "").strip()
+
+
+def _api_key_available() -> bool:
+    if _env_token():
+        return True
+    store = ConfigStore()
+    if not store.path.exists():
+        return False
+    try:
+        return bool(store.load().token)
+    except (OSError, ValueError):
+        return False
 
 
 # Helpers -----------------------------------------------------------------
@@ -810,12 +951,46 @@ def _envelope(extra: Mapping[str, Any]) -> dict[str, Any]:
 # NOTAM lists ---------------------------------------------------------------
 
 
+class _Charges:
+    """Credits for one command: charged amounts from account receipts, estimates otherwise."""
+
+    def __init__(self, backend: Backend, operation: str) -> None:
+        self.backend = backend
+        self.operation = operation
+        self.calls = 0
+        self.charged: int | None = None
+        self.pricing_mode: str | None = None
+
+    def add(self, response: Mapping[str, Any]) -> None:
+        self.calls += 1
+        charged, mode = credits_charged(response)
+        if charged is not None:
+            self.charged = (self.charged or 0) + charged
+            self.pricing_mode = mode or self.pricing_mode
+
+    def fields(self) -> dict[str, Any]:
+        rate = self.backend.cost(self.operation)
+        estimate = self.charged if self.charged is not None else (rate * self.calls if rate is not None else None)
+        data: dict[str, Any] = {"auth": self.backend.mode, "credits_estimate": estimate}
+        if self.charged is not None:
+            data["credits_charged"] = self.charged
+            data["pricing_mode"] = self.pricing_mode
+        return data
+
+
+def _credits_phrase(data: Mapping[str, Any]) -> str:
+    if data.get("credits_charged") is not None:
+        return f"{data['credits_charged']} credit(s) charged"
+    if data.get("credits_estimate") is not None:
+        return f"~{data['credits_estimate']} credit(s)"
+    return "credits: see your account"
+
+
 def _list_notams(
     ctx: Context,
-    *,
-    path: str,
-    fetch: Callable[[dict[str, Any]], Any],
+    operation: str,
     query: dict[str, Any],
+    *,
     transform: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
     render: Callable[[dict[str, Any]], str] | None = None,
 ) -> None:
@@ -826,24 +1001,25 @@ def _list_notams(
         raise CLIError("invalid_arguments", "--per-page must be from 1 to 30", EXIT_USAGE)
     if args.max_pages < 1:
         raise CLIError("invalid_arguments", "--max-pages must be 1 or more", EXIT_USAGE)
+    backend = ctx.backend(operation)
     max_pages = args.max_pages if args.all else 1
-    credits = f"up to {max_pages} credits (1 per page)" if max_pages > 1 else "1 credit"
+    credits = ctx.cost_text(backend, operation, max_pages, up_to=max_pages > 1)
     first = {**query, "page": args.page, "per_page": args.per_page}
-    if ctx.plan("GET", "api", path, query=first, credits=credits):
+    if ctx.plan_operation(backend, operation, first, credits):
         return
     if max_pages > 1:
         ctx.confirm(f"Fetching up to {max_pages} pages", credits)
 
+    charges = _Charges(backend, operation)
     notams: list[dict[str, Any]] = []
     page = args.page
-    pages_fetched = 0
     total = 0
     complete = False
-    while pages_fetched < max_pages:
-        result = _call(lambda: fetch({**query, "page": page, "per_page": args.per_page}))
-        pages_fetched += 1
-        total = result.total_count
-        batch = [n.model_dump(mode="json", by_alias=True) for n in result.notams]
+    while charges.calls < max_pages:
+        result = backend.call(operation, {**query, "page": page, "per_page": args.per_page})
+        charges.add(result)
+        total = int(result.get("total_count") or 0)
+        batch = [n for n in result.get("notams") or [] if isinstance(n, dict)]
         notams.extend(batch)
         # total_count counts NOTAMs before category, subcategory and affected-element filters,
         # which the API applies after paging: a short or empty page is not the end.
@@ -859,11 +1035,11 @@ def _list_notams(
         "filtered_after_paging": filtered,
         "page": args.page,
         "per_page": args.per_page,
-        "pages_fetched": pages_fetched,
+        "pages_fetched": charges.calls,
         "complete": complete,
         # On an incomplete result, page already points past the last fetched page.
         "next_page": None if complete else page,
-        "credits_estimate": pages_fetched,
+        **charges.fields(),
     }
     if transform is not None:
         body = {**transform(notams), **body}
@@ -877,7 +1053,7 @@ def _render_notam_list(data: Mapping[str, Any]) -> str:
     before_filters = " (before filters)" if data.get("filtered_after_paging") else ""
     lines.append(
         f"\n{len(data.get('notams', []))} of {data.get('total_count', 0)}{before_filters} NOTAMs shown; "
-        f"{data.get('pages_fetched', 0)} page(s), ~{data.get('credits_estimate', 0)} credit(s)."
+        f"{data.get('pages_fetched', 0)} page(s), {_credits_phrase(data)}."
         + ("" if data.get("complete") else f" More: --page {data.get('next_page')} or --all.")
     )
     return "\n".join(lines)
@@ -890,11 +1066,12 @@ def _render_notam_line(notam: Mapping[str, Any]) -> str:
         validity += " EST"
     if notam.get("is_permanent"):
         validity += " PERM"
+    category = "/".join(str(v) for v in (interpretation.get("category"), interpretation.get("subcategory")) if v)
     parts = [
         str(notam.get("notam_number", "")),
         str(notam.get("location") or notam.get("icao_code") or ""),
         validity,
-        f"[{interpretation.get('category')}/{interpretation.get('subcategory')}]" if interpretation else "",
+        f"[{category}]" if category else "",
         f"expired {format_short(notam.get('expired_at'))}" if notam.get("expired_at") else "",
     ]
     lines = ["  ".join(part for part in parts if part)]
@@ -928,13 +1105,11 @@ def _active_query(args: argparse.Namespace, *, require_location: bool) -> dict[s
 
 
 def cmd_notams_active(ctx: Context) -> None:
-    query = _active_query(ctx.args, require_location=True)
-    _list_notams(ctx, path="/notams", fetch=lambda q: ctx.client.get_active_notams(q), query=query)
+    _list_notams(ctx, "active", _active_query(ctx.args, require_location=True))
 
 
 def cmd_notams_raw(ctx: Context) -> None:
-    query = _active_query(ctx.args, require_location=True)
-    _list_notams(ctx, path="/notams/raw", fetch=lambda q: ctx.client.get_raw_notams(q), query=query)
+    _list_notams(ctx, "raw", _active_query(ctx.args, require_location=True))
 
 
 def cmd_notams_nearby(ctx: Context) -> None:
@@ -956,7 +1131,7 @@ def cmd_notams_nearby(ctx: Context) -> None:
             "always_include_est": False if args.no_est else None,
         }
     )
-    _list_notams(ctx, path="/notams/nearby", fetch=lambda q: ctx.client.get_nearby_notams(q), query=query)
+    _list_notams(ctx, "nearby", query)
 
 
 def cmd_notams_archive(ctx: Context) -> None:
@@ -979,7 +1154,7 @@ def cmd_notams_archive(ctx: Context) -> None:
             "always_include_est": False if args.no_est else None,
         }
     )
-    _list_notams(ctx, path="/notams/archive", fetch=lambda q: ctx.client.get_historical_notams(q), query=query)
+    _list_notams(ctx, "archive", query)
 
 
 def cmd_notams_expired(ctx: Context) -> None:
@@ -996,20 +1171,19 @@ def cmd_notams_expired(ctx: Context) -> None:
             "excluded_classifications": args.exclude_classification,
         }
     )
-    _list_notams(
-        ctx,
-        path="/notams/recently-expired",
-        fetch=lambda q: ctx.client.get_recently_expired_notams(q),
-        query=query,
-    )
+    _list_notams(ctx, "expired", query)
 
 
 def cmd_notams_get(ctx: Context) -> None:
-    notam_id = ctx.args.notam_id.strip()
-    if ctx.plan("GET", "api", f"/notams/{notam_id}", credits="1 credit"):
+    payload = {"notam_id": ctx.args.notam_id.strip()}
+    backend = ctx.backend("notam")
+    credits = ctx.cost_text(backend, "notam")
+    if ctx.plan_operation(backend, "notam", payload, credits):
         return
-    notam = _call(lambda: ctx.client.get_notam(notam_id))
-    ctx.out.emit(_envelope({"notam": notam}), lambda d: _render_notam_detail(to_jsonable(d["notam"])))
+    result = backend.call("notam", payload)
+    charges = _Charges(backend, "notam")
+    charges.add(result)
+    ctx.out.emit(_envelope({"notam": strip_extras(result), **charges.fields()}), lambda d: _render_notam_detail(d["notam"]))
 
 
 def _render_notam_detail(notam: Mapping[str, Any]) -> str:
@@ -1017,7 +1191,7 @@ def _render_notam_detail(notam: Mapping[str, Any]) -> str:
     lines.append(str(notam.get("icao_message") or notam.get("message") or "").strip())
     interpretation = notam.get("interpretation") or {}
     if interpretation:
-        lines += ["", "Interpretation (informational):", f"  {interpretation.get('description', '')}"]
+        lines += ["", "Interpretation (informational):", f"  {interpretation.get('description') or interpretation.get('excerpt') or ''}"]
         for element in interpretation.get("affected_elements") or []:
             detail = f" — {element['details']}" if element.get("details") else ""
             lines.append(f"  • {element.get('effect')} {element.get('type')} {element.get('identifier')}{detail}")
@@ -1036,6 +1210,8 @@ def cmd_affected(ctx: Context) -> None:
         elements = []
         for notam in notams:
             for element in (notam.get("interpretation") or {}).get("affected_elements") or []:
+                if not isinstance(element, dict):
+                    continue
                 elements.append(
                     _drop_none(
                         {
@@ -1077,20 +1253,13 @@ def cmd_affected(ctx: Context) -> None:
         table = "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
         footer = (
             f"\n{len(data['elements'])} affected elements in {data['notams_scanned']} of {data['total_count']} NOTAMs; "
-            f"~{data['credits_estimate']} credit(s)."
+            f"{_credits_phrase(data)}."
         )
         if not data["complete"]:
             footer += f" Incomplete: more NOTAMs on --page {data['next_page']}, or use --all."
         return table + footer
 
-    _list_notams(
-        ctx,
-        path="/notams",
-        fetch=lambda q: ctx.client.get_active_notams(q),
-        query=query,
-        transform=transform,
-        render=render,
-    )
+    _list_notams(ctx, "active", query, transform=transform, render=render)
 
 
 # Briefings -----------------------------------------------------------------
@@ -1110,13 +1279,19 @@ def cmd_briefing_airport(ctx: Context) -> None:
             "type": "detailed" if args.detailed else None,
         }
     )
-    if ctx.plan("GET", "api", "/notams/briefing/simple", query=query, credits="2 credits"):
+    backend = ctx.backend("airport")
+    credits = ctx.cost_text(backend, "airport")
+    if ctx.plan_operation(backend, "airport", query, credits):
         return
-    ctx.confirm(f"Generating an airport briefing for {query['location']}", "2 credits")
-    result = _call(lambda: ctx.client.generate_airport_briefing(query))
+    ctx.confirm(f"Generating an airport briefing for {query['location']}", credits)
+    result = backend.call("airport", query)
+    charges = _Charges(backend, "airport")
+    charges.add(result)
+    briefing = strip_extras(result)
     ctx.out.emit(
-        _envelope({"briefing": result, "credits_estimate": 2}),
-        lambda d: f"{result.summary.strip()}\n\nNOTAMs: {', '.join(result.notam_ids) or '-'}\n\n{DISCLAIMER}",
+        _envelope({"briefing": briefing, **charges.fields()}),
+        lambda d: f"{str(briefing.get('summary', '')).strip()}\n\nNOTAMs: {', '.join(briefing.get('notam_ids') or []) or '-'}"
+        f"\n{_credits_phrase(d)}.\n\n{DISCLAIMER}",
     )
 
 
@@ -1172,34 +1347,45 @@ def _flight_request(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_flight_create(ctx: Context) -> None:
     body = _flight_request(ctx.args)
-    if ctx.plan("POST", "api", "/notams/briefing", body=body, credits="5 credits"):
+    if getattr(ctx.args, "idempotency_key", None):
+        body["idempotency_key"] = ctx.args.idempotency_key
+    backend = ctx.backend("flight_create")
+    if backend.mode != "account":
+        body.pop("idempotency_key", None)
+    credits = ctx.cost_text(backend, "flight_create")
+    if ctx.plan_operation(backend, "flight_create", body, credits):
         return
     route = " → ".join(str(loc.get("location")) for loc in body.get("locations", []))
-    ctx.confirm(f"Creating a flight briefing for {route}", "5 credits")
-    job = _call(lambda: ctx.client.create_async_briefing(body))
+    ctx.confirm(f"Creating a flight briefing for {route}", credits)
+    job = backend.call("flight_create", body)
+    charges = _Charges(backend, "flight_create")
+    charges.add(job)
+    job_id = str(job.get("uuid", ""))
     if ctx.args.wait:
-        _announce_job(ctx, job.uuid)
-        _wait_for_briefing(ctx, job.uuid)
+        _announce_job(ctx, job_id)
+        _wait_for_briefing(ctx, job_id, backend)
         return
     ctx.out.emit(
-        _envelope({"job": job, "credits_estimate": 5, "next": f"{PROG} briefing flight wait {job.uuid}"}),
-        lambda d: f"Briefing job {job.uuid} is {job.status.value if job.status else 'pending'}.\nWait for it: {PROG} briefing flight wait {job.uuid}",
+        _envelope({"job": strip_extras(job), **charges.fields(), "next": f"{PROG} briefing flight wait {job_id}"}),
+        lambda d: f"Briefing job {job_id} is {job.get('status') or 'pending'}.\nWait for it: {PROG} briefing flight wait {job_id}",
     )
 
 
 def cmd_flight_status(ctx: Context) -> None:
     job_id = _uuid(ctx.args.uuid)
-    if ctx.plan("GET", "api", f"/notams/briefing/{job_id}", credits="free"):
+    backend = ctx.backend("flight_status")
+    if ctx.plan_operation(backend, "flight_status", {"uuid": job_id}, "free"):
         return
-    status = _call(lambda: ctx.client.get_async_briefing_status(job_id))
-    ctx.out.emit(_envelope({"job": status}), _render_briefing_status)
+    status = backend.call("flight_status", {"uuid": job_id})
+    ctx.out.emit(_envelope({"job": strip_extras(status), "auth": backend.mode}), _render_briefing_status)
 
 
 def cmd_flight_wait(ctx: Context) -> None:
     job_id = _uuid(ctx.args.uuid)
-    if ctx.plan("GET", "api", f"/notams/briefing/{job_id}", credits="free"):
+    backend = ctx.backend("flight_status")
+    if ctx.plan_operation(backend, "flight_status", {"uuid": job_id}, "free"):
         return
-    _wait_for_briefing(ctx, job_id)
+    _wait_for_briefing(ctx, job_id, backend)
 
 
 def _uuid(value: str) -> str:
@@ -1218,9 +1404,9 @@ def _announce_job(ctx: Context, job_id: str) -> None:
         ctx.out.note(f"Briefing job {job_id} accepted; waiting… (check later: {PROG} briefing flight wait {job_id})")
 
 
-def _wait_for_briefing(ctx: Context, job_id: str) -> None:
+def _wait_for_briefing(ctx: Context, job_id: str, backend: Backend) -> None:
     try:
-        _poll_briefing(ctx, job_id)
+        _poll_briefing(ctx, job_id, backend)
     except CLIError as exc:
         exc.details.setdefault("uuid", job_id)
         if exc.code not in ("briefing_failed",):
@@ -1233,15 +1419,15 @@ def _wait_for_briefing(ctx: Context, job_id: str) -> None:
         raise
 
 
-def _poll_briefing(ctx: Context, job_id: str) -> None:
+def _poll_briefing(ctx: Context, job_id: str, backend: Backend) -> None:
     args = ctx.args
     deadline = time.monotonic() + max(args.wait_timeout, 0)
     interval = max(args.interval, 0.5)
     while True:
-        status = _call(lambda: ctx.client.get_async_briefing_status(job_id))
-        state = status.status.value
+        status = backend.call("flight_status", {"uuid": job_id})
+        state = str(status.get("status") or "")
         if state == "completed":
-            ctx.out.emit(_envelope({"job": status}), _render_briefing_status)
+            ctx.out.emit(_envelope({"job": strip_extras(status), "auth": backend.mode}), _render_briefing_status)
             return
         if state == "failed":
             raise CLIError(
@@ -1254,7 +1440,7 @@ def _poll_briefing(ctx: Context, job_id: str) -> None:
         if time.monotonic() + interval > deadline:
             raise CLIError(
                 "timeout",
-                f"Briefing job {job_id} is still {state}.",
+                f"Briefing job {job_id} is still {state or 'pending'}.",
                 EXIT_TEMPORARY,
                 f"Polling is free: rerun `{PROG} briefing flight wait {job_id}`.",
                 details={"uuid": job_id, "status": state},
@@ -1264,7 +1450,7 @@ def _poll_briefing(ctx: Context, job_id: str) -> None:
 
 def _render_briefing_status(data: Mapping[str, Any]) -> str:
     job = to_jsonable(data["job"])
-    lines = [f"Briefing {job['uuid']}: {job['status']} (updated {format_short(job.get('updated_at'))})"]
+    lines = [f"Briefing {job.get('uuid')}: {job.get('status')} (updated {format_short(job.get('updated_at'))})"]
     response = job.get("response") or {}
     briefing = response.get("briefing") or {}
     if briefing:
@@ -1278,21 +1464,25 @@ def _render_briefing_status(data: Mapping[str, Any]) -> str:
 
 def cmd_prioritize(ctx: Context) -> None:
     body = {**_flight_request(ctx.args), "notam_id": ctx.args.notam_id.strip()}
-    if ctx.plan("POST", "api", "/notams/prioritisation", body=body, credits="5 credits"):
+    backend = ctx.backend("prioritize")
+    credits = ctx.cost_text(backend, "prioritize")
+    if ctx.plan_operation(backend, "prioritize", body, credits):
         return
-    ctx.confirm(f"Prioritizing NOTAM {body['notam_id']} for this flight", "5 credits")
-    result = _call(lambda: ctx.client.prioritize_notam(body))
+    ctx.confirm(f"Prioritizing NOTAM {body['notam_id']} for this flight", credits)
+    result = backend.call("prioritize", body)
+    charges = _Charges(backend, "prioritize")
+    charges.add(result)
 
     def render(data: Mapping[str, Any]) -> str:
         lines = []
-        for item in to_jsonable(data["result"])["notams"]:
-            notam = item["notam"]
-            lines.append(f"{item['priority']}  {notam.get('notam_number')}  {notam.get('location')}")
+        for item in data["result"].get("notams") or []:
+            notam = item.get("notam") or {}
+            lines.append(f"{item.get('priority')}  {notam.get('notam_number')}  {notam.get('location')}")
             lines.append(f"  {item.get('explanation', '')}")
             lines += [f"  • {c}" for c in item.get("considerations") or []]
         return "\n".join(lines + ["", DISCLAIMER])
 
-    ctx.out.emit(_envelope({"result": result, "credits_estimate": 5}), render)
+    ctx.out.emit(_envelope({"result": strip_extras(result), **charges.fields()}), render)
 
 
 # Watcher ------------------------------------------------------------------
@@ -1569,6 +1759,9 @@ def _emit_delivery(ctx: Context, event: ReceivedEvent) -> None:
 # Auth ---------------------------------------------------------------------
 
 
+ACCOUNT_CONNECTIONS_URL = "https://notamify.com/account#connections"
+
+
 def _token_source() -> tuple[str, str | None]:
     for name in ("NOTAMIFY_TOKEN", "NOTAMIFY_WATCHER_TOKEN"):
         value = os.getenv(name, "").strip()
@@ -1579,7 +1772,14 @@ def _token_source() -> tuple[str, str | None]:
     return token, ("config" if token else None)
 
 
-def cmd_auth_login(ctx: Context) -> None:
+def _read_raw_config(store: ConfigStore) -> dict[str, Any]:
+    if not store.path.exists():
+        return {}
+    raw = json.loads(store.path.read_text(encoding="utf-8"))
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_api_key(ctx: Context) -> None:
     if ctx.args.token_stdin:
         token = sys.stdin.read().strip()
     elif interactive():
@@ -1595,68 +1795,187 @@ def cmd_auth_login(ctx: Context) -> None:
     if not token or any(ch.isspace() for ch in token):
         raise CLIError("invalid_arguments", "the API key is empty or contains whitespace", EXIT_USAGE)
     store = ConfigStore()
-    cfg = store.load() if store.path.exists() else SDKConfig()
-    raw: dict[str, Any] = {}
-    if store.path.exists():
-        try:
-            raw = json.loads(store.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = {}
-    cfg.api_base_url = str(raw.get("api_base_url") or SDKConfig().api_base_url)
-    cfg.watcher_base_url = str(raw.get("watcher_base_url") or raw.get("base_url") or SDKConfig().watcher_base_url)
-    cfg.token = token
+    raw = _read_raw_config(store)
+    cfg = SDKConfig(
+        api_base_url=str(raw.get("api_base_url") or SDKConfig().api_base_url),
+        watcher_base_url=str(raw.get("watcher_base_url") or raw.get("base_url") or SDKConfig().watcher_base_url),
+        token=token,
+    )
     store.save(cfg)
     env_token = os.getenv("NOTAMIFY_TOKEN", "").strip()
     if env_token and env_token != token:
         ctx.out.note("Note: NOTAMIFY_TOKEN is set and takes precedence over the saved key.")
     ctx.out.emit(
-        {"saved": True, "config_path": str(store.path), "token": mask_secret(token)},
+        {"saved": True, "method": "api_key", "config_path": str(store.path), "token": mask_secret(token)},
         lambda d: f"Saved API key {d['token']} to {d['config_path']}.",
     )
 
 
+def cmd_auth_login(ctx: Context) -> None:
+    args = ctx.args
+    if args.token_stdin or args.api_key:
+        _save_api_key(ctx)
+        return
+    auth = AccountAuth()
+
+    def show(url: str) -> None:
+        if ctx.out.json:
+            ctx.out.stderr.write(
+                json.dumps(
+                    {
+                        "event": "sign_in",
+                        "url": url,
+                        "browser_opened": not args.no_browser,
+                        "waiting_seconds": int(args.login_timeout),
+                        "message": "Open the URL in a browser to approve the Notamify CLI.",
+                    }
+                )
+                + "\n"
+            )
+            ctx.out.stderr.flush()
+            return
+        ctx.out.stderr.write(
+            "Sign in to Notamify in your browser to connect the CLI:\n"
+            f"  {url}\n"
+            + ("" if args.no_browser else "If no browser opened, open the link above.\n")
+            + f"Waiting up to {int(args.login_timeout)} seconds…\n"
+        )
+        ctx.out.stderr.flush()
+
+    try:
+        session = auth.login(open_browser=not args.no_browser, port=args.port, timeout=args.login_timeout, on_url=show)
+    except AccountError as exc:
+        raise error_from_account(exc) from exc
+
+    # A free call that proves the session works end to end.
+    tools: int | None = None
+    verify_error = None
+    try:
+        tools = len(McpClient(auth, timeout=30, client_version=SDK_VERSION).list_tools())
+    except AccountError as exc:
+        verify_error = exc.message
+    missing = [scope for scope in SCOPES if scope not in session.scopes]
+    if _env_token():
+        ctx.out.note("Note: NOTAMIFY_TOKEN is set, so commands use the API key unless you pass --auth account.")
+    data = {
+        "signed_in": True,
+        "method": "account",
+        "scopes": session.scopes,
+        "missing_scopes": missing,
+        "tools_available": tools,
+        "verified": tools is not None,
+        "verify_error": verify_error,
+        "session_path": str(auth.store.path),
+        "manage_url": ACCOUNT_CONNECTIONS_URL,
+    }
+
+    def render(d: Mapping[str, Any]) -> str:
+        lines = ["Signed in to Notamify."]
+        if d["verified"]:
+            lines.append(f"Connection verified: {d['tools_available']} tools available.")
+        else:
+            lines.append(f"Signed in, but the check call failed: {d['verify_error']}")
+        if d["missing_scopes"]:
+            lines.append("Briefing generation was not approved; run `notamify auth login` again to allow it.")
+        lines.append(f"Manage or revoke this connection at {ACCOUNT_CONNECTIONS_URL}.")
+        return "\n".join(lines)
+
+    ctx.out.emit(data, render)
+
+
 def cmd_auth_status(ctx: Context) -> None:
     token, source = _token_source()
-    client_cfg = ConfigStore().load()
+    session = AccountStore().load()
+    try:
+        client_cfg = ConfigStore().load()
+    except ValueError:
+        client_cfg = SDKConfig()
+    if _env_token():
+        notams_auth = "api_key"
+    elif session is not None:
+        notams_auth = "account"
+    elif token:
+        notams_auth = "api_key"
+    else:
+        notams_auth = None
+    account = None
+    if session is not None:
+        account = {
+            "signed_in": True,
+            "scopes": session.scopes,
+            "access_token_expires_at": format_iso(datetime.fromtimestamp(session.expires_at, timezone.utc)),
+            "signed_in_at": format_iso(datetime.fromtimestamp(session.signed_in_at, timezone.utc)),
+            "session_path": str(AccountStore().path),
+        }
     data = {
-        "authenticated": bool(token),
-        "source": source,
-        "token": mask_secret(token) if token else None,
+        "authenticated": bool(token or session),
+        "notams_and_briefings": notams_auth,
+        "watcher": "api_key" if token else None,
+        "account": account,
+        "api_key": {"source": source, "token": mask_secret(token)} if token else None,
         "config_path": str(ConfigStore().path),
         "api_base_url": client_cfg.api_base_url,
         "watcher_base_url": client_cfg.watcher_base_url,
+        "mcp_url": AccountAuth().mcp_url,
         "verified": False,
     }
-    ctx.out.emit(
-        data,
-        lambda d: (
-            f"API key {d['token']} from {d['source']} (not verified; checking would spend a credit)."
-            if d["authenticated"]
-            else f"No API key. Set NOTAMIFY_TOKEN or run `{PROG} auth login`."
-        )
-        + f"\nAPI {d['api_base_url']}\nWatcher {d['watcher_base_url']}",
-    )
-    if not token:
+
+    def render(d: Mapping[str, Any]) -> str:
+        lines = []
+        if d["account"]:
+            lines.append(f"Account: signed in ({', '.join(d['account']['scopes'])}).")
+        else:
+            lines.append(f"Account: not signed in. Run `{PROG} auth login`.")
+        if d["api_key"]:
+            lines.append(f"API key: {d['api_key']['token']} from {d['api_key']['source']}.")
+        else:
+            lines.append(f"API key: none. Run `{PROG} auth login --api-key` or set NOTAMIFY_TOKEN.")
+        names = {"account": "your account", "api_key": "the API key", None: "nothing (sign in first)"}
+        lines.append(f"NOTAMs and briefings use {names[d['notams_and_briefings']]}; Watcher uses {names[d['watcher']]}.")
+        lines.append("Not verified against the server; data requests spend credits.")
+        return "\n".join(lines)
+
+    ctx.out.emit(data, render)
+    if not data["authenticated"]:
         raise SilentExit(EXIT_AUTH)
 
 
 def cmd_auth_logout(ctx: Context) -> None:
+    args = ctx.args
+    both = not args.account and not args.api_key
+    signed_out = False
+    if both or args.account:
+        signed_out = AccountAuth().logout()
+    removed_key = False
     store = ConfigStore()
-    removed = False
-    if store.path.exists():
-        cfg = store.load()
-        raw = json.loads(store.path.read_text(encoding="utf-8"))
-        removed = bool(raw.get("token"))
-        cfg.token = ""
-        cfg.api_base_url = str(raw.get("api_base_url") or SDKConfig().api_base_url)
-        cfg.watcher_base_url = str(raw.get("watcher_base_url") or raw.get("base_url") or SDKConfig().watcher_base_url)
-        store.save(cfg)
+    if (both or args.api_key) and store.path.exists():
+        raw = _read_raw_config(store)
+        removed_key = bool(raw.get("token"))
+        if removed_key:
+            store.save(
+                SDKConfig(
+                    api_base_url=str(raw.get("api_base_url") or SDKConfig().api_base_url),
+                    watcher_base_url=str(raw.get("watcher_base_url") or raw.get("base_url") or SDKConfig().watcher_base_url),
+                    token="",
+                )
+            )
     if os.getenv("NOTAMIFY_TOKEN", "").strip():
         ctx.out.note("NOTAMIFY_TOKEN is still set in this environment.")
-    ctx.out.emit(
-        {"removed": removed, "config_path": str(store.path)},
-        lambda d: "Removed the stored API key." if removed else "No stored API key.",
-    )
+    data = {"account_signed_out": signed_out, "api_key_removed": removed_key, "config_path": str(store.path)}
+
+    def render(d: Mapping[str, Any]) -> str:
+        lines = []
+        if both or args.account:
+            lines.append(
+                f"Signed out of your Notamify account (connection revoked; it is listed at {ACCOUNT_CONNECTIONS_URL})."
+                if signed_out
+                else "Not signed in to an account."
+            )
+        if both or args.api_key:
+            lines.append("Removed the stored API key." if removed_key else "No stored API key.")
+        return "\n".join(lines)
+
+    ctx.out.emit(data, render)
 
 
 # Meta ---------------------------------------------------------------------
@@ -1724,12 +2043,21 @@ def describe_commands(parser: argparse.ArgumentParser) -> dict[str, Any]:
         "name": PROG,
         "version": SDK_VERSION,
         "output": "Text on a terminal, JSON when stdout is not a terminal; force with --json, --output or NOTAMIFY_OUTPUT.",
-        "errors": 'JSON mode writes {"error": {"code", "message", "exit_code", "remediation", ...}} to stderr.',
+        "errors": (
+            'JSON mode writes JSON lines to stderr; on failure the last line is {"error": {"code", "message", '
+            '"exit_code", "remediation", ...}}. `auth login` first writes {"event": "sign_in", "url": ...}.'
+        ),
         "confirmation": (
             "Commands that may spend more than one credit or change Watcher state exit 4 unless --yes is given. "
             "The error has credits_estimate and confirm_command; ask the user, then run confirm_command."
         ),
         "pagination": "List results report complete and next_page. complete=false means more NOTAMs exist.",
+        "authentication": (
+            "Two ways: `notamify auth login` signs in with a Notamify account in the browser (connected-app pricing; "
+            "NOTAMs and briefings), or an API key via NOTAMIFY_TOKEN / `auth login --api-key` (all commands, including "
+            "Watcher and `notams raw`). --auth auto prefers NOTAMIFY_TOKEN, then the account, then a stored key. "
+            "Results report auth, and credits_charged when the server reports the charge."
+        ),
         "environment": {
             "NOTAMIFY_TOKEN": "API key; takes precedence over the config file",
             "NOTAMIFY_CONFIG_FILE": "config file path (default ~/.config/notamify/config.json)",
@@ -1737,6 +2065,9 @@ def describe_commands(parser: argparse.ArgumentParser) -> dict[str, Any]:
             "NOTAMIFY_WATCHER_BASE_URL": "Watcher API base URL",
             "NOTAMIFY_WEBHOOK_SECRET": "secret for `webhook listen` signature checks",
             "NOTAMIFY_OUTPUT": "text or json",
+            "NOTAMIFY_AUTH": "auto, account or api-key (same as --auth)",
+            "NOTAMIFY_ACCOUNT_FILE": "account session file (default next to the config file, account.json)",
+            "NOTAMIFY_MCP_URL": "Notamify connected-app server for account sign-in (default https://mcp.notamify.com/mcp)",
         },
         "exit_codes": {str(code): text for code, text in EXIT_CODES.items()},
         "commands": commands,
