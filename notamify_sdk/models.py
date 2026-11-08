@@ -67,14 +67,29 @@ class ListenerMetadata(NotamifyModel):
 
 
 class ListenerTimeWindowFilter(NotamifyModel):
+    """A recurring (``days``/``start``/``end``) or absolute (``start_at``/``end_at``) delivery window."""
+
+    # Unknown keys are kept so that new Watcher filter options are never silently dropped.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    type: str | None = None
     days: list[str] | None = None
     start: str | None = None
     end: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
 
 
 class ListenerAffectedElementFilter(NotamifyModel):
+    # Unknown keys are kept so that new Watcher filter options are never silently dropped.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     effect: str | None = None
     type: str | None = None
+    subtype: str | None = None
+    identifier: str | None = None
+    applies_to: dict[str, Any] | None = None
+    changes: list[dict[str, Any]] | None = None
 
 
 class ListenerFilters(NotamifyModel):
@@ -84,6 +99,9 @@ class ListenerFilters(NotamifyModel):
     notam_icao: list[str] | None = None
     notam_type: list[str] | None = None
     airport_type: list[str] | None = None
+    aircraft_type: list[str] | None = None
+    aircraft_designator: list[str] | None = None
+    aircraft_family: list[str] | None = None
     category: list[str] | None = None
     subcategory: list[str] | None = None
     qcode: list[str] | None = None
@@ -519,13 +537,27 @@ class WebhookLifecycleChange(NotamifyModel):
 
 
 class WatcherWebhookEvent(NotamifyModel):
+    """A Watcher webhook delivery.
+
+    Production NOTAM deliveries have ``kind``, ``event_id`` and ``notam``. Sandbox test
+    deliveries have ``notam`` but no ``kind`` or ``event_id``. When the account runs out of
+    credits, Watcher sends a notice with only ``listener_id``, ``sent_at`` and ``error``.
+    ``context.location`` can be null.
+    """
+
     listener_id: str
-    kind: WebhookMessageKind
-    event_id: str
-    notam: NotamDTO
     sent_at: datetime
+    kind: WebhookMessageKind | None = None
+    event_id: str | None = None
+    notam: NotamDTO | None = None
     change: WebhookLifecycleChange | None = None
     context: WebhookContext | None = None
+    error: str | None = None
+
+    @property
+    def is_error(self) -> bool:
+        """True for a notice (such as credits exhausted) that carries no NOTAM."""
+        return self.error is not None and self.notam is None
 
     @model_validator(mode="after")
     def validate_change_payload(self) -> "WatcherWebhookEvent":

@@ -1493,10 +1493,13 @@ def cmd_webhook_listen(ctx: Context) -> None:
 
 def _emit_delivery(ctx: Context, event: ReceivedEvent) -> None:
     parsed = event.webhook_event
+    kind = parsed.kind.value if parsed and parsed.kind else event.body.get("kind")
+    if kind is None:
+        kind = "error" if event.body.get("error") else "sandbox"
     record = {
         "type": "delivery",
         "signature_verified": event.signature_verified,
-        "kind": parsed.kind.value if parsed else event.body.get("kind"),
+        "kind": kind,
         "event_id": parsed.event_id if parsed else event.body.get("event_id"),
         "listener_id": parsed.listener_id if parsed else event.body.get("listener_id"),
         "valid_payload": parsed is not None,
@@ -1510,7 +1513,8 @@ def _emit_delivery(ctx: Context, event: ReceivedEvent) -> None:
     change = (event.body.get("change") or {}).get("changed_notam_id")
     ctx.out.stdout.write(
         f"{format_short(now_utc())}  {record['kind']}  {notam.get('notam_number', '?')}  {notam.get('location', '')}  "
-        f"[{verified}]" + (f"  changes {change}" if change else "") + "\n"
+        f"[{verified}]" + (f"  changes {change}" if change else "")
+        + (f"  error: {event.body['error']}" if event.body.get("error") else "") + "\n"
     )
     ctx.out.stdout.flush()
 
