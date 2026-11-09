@@ -63,7 +63,10 @@ jobs:
             dist/notamify-*
           if-no-files-found: error
 
-  publish-pypi:
+  # Each package publishes from its own job and GitHub environment. PyPI trusted
+  # publishing scopes a job's token to the publisher matching its claims; with
+  # identical claims the existing notamify-sdk publisher would win for both.
+  publish-sdk:
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -78,30 +81,49 @@ jobs:
           name: release-dists
           path: dist
 
-      # notamify pins notamify-sdk==<version>, so the SDK must be on PyPI first.
-      - name: Split distributions
+      - name: Keep notamify-sdk only
         run: |
-          mkdir -p dist-sdk dist-cli
-          mv dist/notamify_sdk-* dist-sdk/
-          mv dist/notamify-* dist-cli/
-          ls dist-sdk dist-cli
+          rm dist/notamify-[0-9]*
+          ls dist
 
       - name: Publish notamify-sdk to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist-sdk
+          packages-dir: dist
           skip-existing: true
+
+  # notamify pins notamify-sdk==<version>, so it publishes after the SDK.
+  publish-cli:
+    needs: publish-sdk
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment:
+      name: pypi-notamify
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dists
+          path: dist
+
+      - name: Keep notamify only
+        run: |
+          rm dist/notamify_sdk-*
+          ls dist
 
       - name: Publish notamify to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist-cli
+          packages-dir: dist
           skip-existing: true
 
   github-release:
     needs:
       - build
-      - publish-pypi
+      - publish-sdk
+      - publish-cli
     runs-on: ubuntu-latest
     permissions:
       contents: write
